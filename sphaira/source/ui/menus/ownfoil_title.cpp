@@ -12,12 +12,14 @@
 #include "defines.hpp"
 #include "image.hpp"
 #include "download.hpp"
+#include "hasher.hpp"
 #include "evman.hpp"
 #include "i18n.hpp"
 #include "log.hpp"
 #include "utils/utils.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -197,7 +199,10 @@ auto StripGameName(const std::string& name, const std::string& game) -> std::str
 
 // the shop spells an id as 16 hex digits, and yati compares the number.
 auto ParseId(const std::string& id) -> u64 {
-    return std::strtoull(id.c_str(), nullptr, 16);
+    if (id.size() != 16) return 0;
+    char* end{};
+    const auto value = std::strtoull(id.c_str(), &end, 16);
+    return end && *end == '\0' ? value : 0;
 }
 
 auto IsSpace(char c) -> bool {
@@ -270,11 +275,76 @@ void DeleteTexture(int image) {
     }
 }
 
+// Successful downloads remain here for local installation or a separate DBI
+// launch. A random suffix avoids replacing a user's existing package.
+constexpr const char* DOWNLOAD_DIR = "/switch/NinMagicFoil/downloads";
+
+auto DownloadPackage(ProgressBox* pbox, const sphaira::ownfoil::Config& config,
+    const std::string& base_url, const api::ShopDownload& download, const std::string& title,
+    fs::FsPath& saved) -> Result {
+    R_UNLESS(download.extension == "nsp" || download.extension == "nsz" || download.extension == "xci" || download.extension == "xcz", SvcError_InvalidArgument);
+    R_UNLESS(sphaira::ownfoil::IsSafeAddress(download.url), SvcError_InvalidArgument);
+    fs::FsNativeSd sd;
+    R_TRY(sd.CreateDirectoryRecursively(DOWNLOAD_DIR));
+    s64 free_space{};
+    R_TRY(sd.GetFreeSpace(DOWNLOAD_DIR, &free_space));
+    R_UNLESS(download.size <= 0 || free_space >= download.size, FsError_UsableSpaceNotEnoughSdCard);
+    std::string name;
+    for (const auto c : title) {
+        if (name.size() >= 64) break;
+        name += std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == ' ' ? c : '_';
+    }
+    if (name.empty()) name = "package";
+    char suffix[32]{};
+    std::snprintf(suffix, sizeof(suffix), "-%016lx", randomGet64());
+    saved = std::string(DOWNLOAD_DIR) + '/' + name + suffix + '.' + download.extension;
+    const fs::FsPath partial{saved.toString() + ".part"};
+    ON_SCOPE_EXIT(sd.DeleteFile(partial));
+    const auto local = sphaira::ownfoil::IsSameOrigin(base_url, download.url);
+    pbox->SetActionName("Downloading to SD"_i18n).NewTransfer(name);
+    bool space_ok = true;
+    const auto result = curl::Api().ToFile(curl::Url{download.url}, curl::Path{partial},
+        curl::UserPass{local ? config.user : "", local ? config.pass : ""}, curl::PreemptiveAuth{true},
+        curl::Flags{curl::Flag_BigFile | (config.legacy_html ? curl::Flag_LegacyOwnfoil : 0)}, curl::StopToken{pbox->GetToken()},
+        curl::OnProgress{[pbox, free_space, &space_ok](s64 total, s64 now, s64, s64) {
+            space_ok = (total <= 0 || total <= free_space) && now <= free_space;
+            pbox->UpdateTransfer(now, total);
+            return space_ok && !pbox->ShouldExit();
+        }});
+    R_TRY(pbox->ShouldExitResult());
+    R_UNLESS(space_ok, FsError_UsableSpaceNotEnoughSdCard);
+    R_UNLESS(result.success && result.code == 200, Result_GhdlFailedToDownloadAsset);
+    s64 actual_size{};
+    FsTimeStampRaw timestamp{};
+    R_TRY(sd.FileGetSizeAndTimestamp(partial, &timestamp, &actual_size));
+    R_UNLESS(actual_size > 0 && (download.size <= 0 || actual_size == download.size), SvcError_InvalidSize);
+    // A successful HTTP login page is not a successfully downloaded package.
+    // These are container signatures only; the installer still validates content.
+    {
+        fs::File file;
+        R_TRY(sd.OpenFile(partial, FsOpenMode_Read, &file));
+        char magic[4]{};
+        u64 read{};
+        const bool card = download.extension == "xci" || download.extension == "xcz";
+        R_TRY(file.Read(card ? 0x100 : 0, magic, sizeof(magic), FsReadOption_None, &read));
+        R_UNLESS(read == sizeof(magic) && !std::memcmp(magic, card ? "HEAD" : "PFS0", sizeof(magic)), card ? Result_XciBadMagic : Result_NspBadMagic);
+    }
+    if (!download.sha256.empty()) {
+        pbox->SetActionName("Checking SHA-256"_i18n);
+        std::string actual_hash;
+        R_TRY(hash::Hash(pbox, hash::Type::Sha256, &sd, partial, actual_hash));
+        R_UNLESS(!strcasecmp(actual_hash.c_str(), download.sha256.c_str()), SvcError_InvalidState);
+    }
+    R_TRY(pbox->ShouldExitResult());
+    R_TRY(sd.RenameFile(partial, saved));
+    R_SUCCEED();
+}
+
 } // namespace
 
 auto BuildImageCache(const std::string& app_id, const std::string& url, const char* kind) -> fs::FsPath {
     fs::FsPath path;
-    std::snprintf(path, sizeof(path), "%s/%s_%s_%016lx.jpg", CACHE_PATH, app_id.c_str(), kind, std::hash<std::string>{}(url));
+    std::snprintf(path, sizeof(path), "%s/%016lx_%s_%016lx.jpg", CACHE_PATH, std::hash<std::string>{}(app_id), kind, std::hash<std::string>{}(url));
     return path;
 }
 
@@ -959,13 +1029,20 @@ void TitleMenu::ShowInstallOptions() {
         ? "This add-on is already installed."_i18n
         : "Nothing to install: the console already has this version or a newer one, and no add-on is ticked."_i18n);
 
+    options->Add<SidebarEntryCallback>("Download to SD"_i18n, [this]() {
+        Install(true, true);
+    }, "Save the selected packages to /switch/NinMagicFoil/downloads for DBI or another installer. Requires room for the complete download."_i18n);
+    options->Add<SidebarEntryCallback>("Download and install locally"_i18n, [this]() {
+        Install(true, false);
+    }, "Download the complete package, then install from the SD card. Keeps the file for retrying with another installer."_i18n);
+
     // the menu opens on Install, which is what it is opened for: everything
     // above it only qualifies that press.
     options->SetDefaultEntry(*install);
 }
 
-void TitleMenu::Install() {
-    if (!App::GetInstallEnable()) {
+void TitleMenu::Install(bool save_to_sd, bool download_only) {
+    if (!download_only && !App::GetInstallEnable()) {
         App::ShowEnableInstallPrompt();
         return;
     }
@@ -993,7 +1070,7 @@ void TitleMenu::Install() {
         if (it == targets.end()) {
             it = targets.emplace(targets.end(), Target{download});
         }
-        it->ids.emplace_back(id);
+        if (id) it->ids.emplace_back(id);
     };
 
     if (m_page.dlc) {
@@ -1005,14 +1082,14 @@ void TitleMenu::Install() {
 
             // a game the console hasn't got needs its base game under any update.
             const auto& base = m_title.versions.front();
-            if (!m_installed.installed && base.version == 0) {
+            if ((!m_installed.installed || (download_only && chosen.version == 0)) && base.version == 0) {
                 add(base.download, game_id);
             }
 
             // an update's id is its game's with 0x800 set. the installed version
             // puts nothing new on the console: chosen, it installs the add-ons alone.
-            if (chosen.version > 0 && !(m_installed.installed && chosen.version == m_installed.version)) {
-                add(chosen.download, game_id ^ 0x800);
+            if (chosen.version > 0 && (download_only || !(m_installed.installed && chosen.version == m_installed.version))) {
+                add(chosen.download, game_id ? (game_id ^ 0x800) : 0);
             }
         }
 
@@ -1036,20 +1113,39 @@ void TitleMenu::Install() {
     // the page, so nothing here may be captured by it. a running install is
     // either on screen or off the stack, so only the install menu is closed.
     App::PopToMenu();
-    InstallQueue::Get().Add(GetName(), 0, [config = m_config, targets](ProgressBox* pbox) -> Result {
+    const auto title = GetName();
+    auto task = [config = m_config, base_url = m_base_url, targets, title, save_to_sd, download_only](ProgressBox* pbox) -> Result {
         for (const auto& target : targets) {
-            yati::source::Http source{target.download.url, config.user, config.pass, pbox->GetToken()};
-
             yati::ConfigOverride config_override{};
             config_override.title_ids = target.ids;
 
-            // yati picks the container by the path's extension.
-            const auto path = "download." + target.download.extension;
-            R_TRY(yati::InstallFromSource(pbox, &source, path, config_override));
+            if (save_to_sd) {
+                fs::FsPath saved;
+                R_TRY(DownloadPackage(pbox, config, base_url, target.download, title, saved));
+                if (!download_only) {
+                    fs::FsNativeSd sd;
+                    pbox->SetActionName("Installing local package"_i18n);
+                    R_TRY(yati::InstallFromFile(pbox, &sd, saved, config_override));
+                }
+            } else {
+                const auto local = sphaira::ownfoil::IsSameOrigin(base_url, target.download.url);
+                yati::source::Http source{target.download.url, local ? config.user : "", local ? config.pass : "", pbox->GetToken(), config.legacy_html};
+                const auto path = "download." + target.download.extension;
+                R_TRY(yati::InstallFromSource(pbox, &source, path, config_override));
+            }
         }
 
         R_SUCCEED();
-    });
+    };
+    if (download_only) {
+        App::Push<ProgressBox>(0, "Downloading to SD"_i18n, title, task, [](Result rc) {
+            if (R_SUCCEEDED(App::PushErrorBox(rc, "Download failed. Incomplete files were removed."_i18n))) {
+                App::Notify("Packages saved in /switch/NinMagicFoil/downloads"_i18n);
+            }
+        });
+    } else {
+        InstallQueue::Get().Add(title, 0, task);
+    }
 }
 
 void TitleMenu::ShowAddons(const std::function<void()>& changed) {

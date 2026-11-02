@@ -267,6 +267,12 @@ void InstallQueue::Draw(NVGcontext* vg, Theme* theme) {
     gfx::drawTextArgs(vg, pill.x + pill.w - 20.f, pill.y + 18.f, 18.f, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE, theme->GetColour(ThemeEntryID_TEXT_INFO), "%s", right.c_str());
 }
 
+auto InstallQueue::GetSnapshot() const -> std::vector<Snapshot> {
+    std::vector<Snapshot> out;
+    for (const auto& job : m_jobs) out.push_back({job.name, job.state, job.rc, job.id});
+    return out;
+}
+
 void InstallQueue::ShowMenu() {
     auto options = std::make_unique<Sidebar>("Install queue"_i18n, Sidebar::Side::RIGHT, 560.f);
     ON_SCOPE_EXIT(App::Push(std::move(options)));

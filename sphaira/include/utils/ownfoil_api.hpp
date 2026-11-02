@@ -34,6 +34,8 @@ struct ServerInfo {
 
 struct ConnectResult {
     bool success{};
+    bool json_index{};
+    bool legacy_html{};
     bool used_remote{}; // false = connected via local_address.
     bool reached{}; // the server answered, even if it answered with an error.
     bool refused{}; // the server itself turned the request down: bad credentials, no access.
@@ -54,6 +56,8 @@ struct ShopImage {
 struct ShopDownload {
     std::string url{};       // absolute, resolved against the shop root.
     std::string extension{}; // nsp, nsz, xci or xcz; empty when the shop didn't say.
+    s64 size{}; // package bytes when the server provides them, otherwise 0.
+    std::string sha256{}; // optional digest supplied by a plain index.
 };
 
 // a card lives as long as the page it arrived on, and a page can outlast a
@@ -66,6 +70,7 @@ enum class AppType {
 
 // one browsable game in the shop's catalog.
 struct ShopApp {
+    bool directory{}; // lazy navigation for older Ownfoil servers
     AppType type{AppType::Base};
     std::string app_id{};
     // the game this belongs to, the app id itself for a base game. an update

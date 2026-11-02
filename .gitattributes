@@ -1,0 +1,15 @@
+* text=auto
+*.sh text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.py text eol=lf
+*.ps1 text eol=crlf
+*.jpg binary
+*.png binary
+*.pem text eol=lf
+
+# Preserve upstream vendor files byte-for-byte.
+sphaira/source/ff16/** -text

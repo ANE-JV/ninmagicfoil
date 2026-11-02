@@ -9,6 +9,7 @@ namespace sphaira::ui::menu {
 enum MenuFlag {
     MenuFlag_None = 0,
     MenuFlag_Tab = 1 << 1,
+    MenuFlag_Embedded = 1 << 2,
 };
 
 struct PolledData {
@@ -54,6 +55,8 @@ struct MenuBase : Widget {
     auto IsTab() const -> bool {
         return m_flags & MenuFlag_Tab;
     }
+
+    auto IsEmbedded() const -> bool { return m_flags & MenuFlag_Embedded; }
 
     static auto GetPolledData(bool force_refresh = false) -> PolledData;
 

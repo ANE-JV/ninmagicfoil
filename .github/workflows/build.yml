@@ -1,0 +1,125 @@
+name: Build NinMagicFoil
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-policy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Test publication policy without network or credentials
+        run: node tools/tests/test_release_workflow.mjs
+  switch:
+    needs: release-policy
+    runs-on: ubuntu-24.04
+    # Official devkitPro image, pinned instead of following a changing latest tag.
+    container: devkitpro/devkita64@sha256:1fc388c3a0d34bd2045a6dadcb1020e069d5f876a187fd705de14b4440c00282
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Configure Git for this checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Validate release tooling
+        run: |
+          python3 tools/check-public-source.py
+          python3 -m unittest discover -s tools/tests -p 'test_release_pipeline.py'
+      - name: Build Switch application
+        env:
+          NINMAGIC_BUILD_JOBS: '4'
+        run: bash tools/build-ninmagicfoil.sh "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/build/ninmagicfoil"
+      - name: Test updater, HTTP range and Ownfoil policies on host
+        run: python3 tools/run-host-tests.py --yyjson build/ninmagicfoil/_deps/yyjson-src/src --output build/host-tests --cc gcc --cxx g++
+      - name: Verify and package
+        run: |
+          mkdir -p dist
+          python3 tools/verify-ninmagicfoil.py build/ninmagicfoil/NinMagicFoil.nro --output dist/verification.json
+          cp build/ninmagicfoil/NinMagicFoil.nro dist/NinMagicFoil.nro
+          python3 tools/package-ninmagicfoil.py build/ninmagicfoil/NinMagicFoil.nro --build-dir build/ninmagicfoil --devkitpro "$DEVKITPRO"
+      - name: Upload verified artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: NinMagicFoil
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: switch
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'ANE-JV/ninmagicfoil'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: NinMagicFoil
+          path: dist
+      - name: Publish matching version after hash verification
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const fs = require('fs');
+            const crypto = require('crypto');
+            const path = require('path');
+            const verification = JSON.parse(fs.readFileSync('dist/verification.json', 'utf8'));
+            const tag = context.ref.replace('refs/tags/', '');
+            if (tag !== `v${verification.version}` || verification.nacp_name !== 'NinMagicFoil'
+                || !verification.own_update_channel_checked) {
+              throw new Error('Tag does not match the verified NRO version/identity.');
+            }
+            const names = ['ninmagicfoil.zip', 'NinMagicFoil.nro', 'SHA256SUMS', 'verification.json'];
+            const inputs = names.map(name => {
+              const data = fs.readFileSync(path.join('dist', name));
+              return {name, data, hash: crypto.createHash('sha256').update(data).digest('hex')};
+            });
+            const checksums = new Map(fs.readFileSync('dist/SHA256SUMS', 'utf8').trim().split('\n')
+              .map(line => {const match = /^([a-f0-9]{64})  ([A-Za-z0-9._-]+)$/.exec(line);
+                if (!match) throw new Error('Invalid SHA256SUMS format.');
+                return [match[2], match[1]];}));
+            for (const entry of inputs.slice(0, 2)) {
+              if (checksums.get(entry.name) !== entry.hash) throw new Error(`Checksum mismatch: ${entry.name}`);
+            }
+            if (inputs[1].hash !== verification.sha256) throw new Error('NRO verification digest mismatch.');
+            const repo = context.repo;
+            let release;
+            try { release = (await github.rest.repos.getReleaseByTag({...repo, tag})).data; }
+            catch (error) {
+              if (error.status !== 404) throw error;
+              release = (await github.rest.repos.createRelease({...repo, tag_name: tag,
+                name: `NinMagicFoil ${verification.version}`, draft: true, prerelease: false,
+                body: 'Versión inicial de desarrollo. Incluye NRO, ZIP para la microSD y sumas SHA-256. '
+                    + 'Las pruebas automáticas comprueban compilación, políticas y estructura del NRO; '
+                    + 'la compatibilidad en consola debe validarse con el hardware y archivos correspondientes. '
+                    + 'Consulta README y docs para funciones y límites conocidos.'})).data;
+            }
+            const assets = await github.paginate(github.rest.repos.listReleaseAssets, {...repo, release_id: release.id});
+            for (const entry of inputs) {
+              let asset = assets.find(candidate => candidate.name === entry.name);
+              if (!asset) {
+                asset = (await github.rest.repos.uploadReleaseAsset({...repo, release_id: release.id,
+                  name: entry.name, data: entry.data,
+                  headers: {'content-type': 'application/octet-stream', 'content-length': entry.data.length}})).data;
+              }
+              // Never replace an asset already published under the same version.
+              for (let attempt = 0; !asset.digest && attempt < 3; ++attempt) {
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                asset = (await github.rest.repos.getReleaseAsset({...repo, asset_id: asset.id})).data;
+              }
+              if (asset.size !== entry.data.length || asset.digest !== `sha256:${entry.hash}`) {
+                throw new Error(`Uploaded/existing asset digest differs: ${entry.name}; release left unchanged.`);
+              }
+            }
+            if (release.draft) {
+              release = (await github.rest.repos.updateRelease({...repo, release_id: release.id, draft: false})).data;
+            }
+            core.notice(`Verified release: ${release.html_url}`);

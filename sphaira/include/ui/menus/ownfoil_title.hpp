@@ -17,7 +17,7 @@ namespace sphaira::ui::menu::ownfoil {
 
 // shared by the catalog and the pages it opens, so artwork the grid already
 // fetched is read back rather than fetched again.
-inline constexpr auto CACHE_PATH = "/switch/sphaira/cache/ownfoil";
+inline constexpr auto CACHE_PATH = "/switch/NinMagicFoil/cache/ownfoil";
 
 // keyed on the url, not the app id: two shops can answer with different art for
 // one game, and a shop swaps a hotlink for its own copy as the download lands.
@@ -146,7 +146,7 @@ private:
     // A off the rows. what the menu is set to lives on the page rather than in the
     // sidebar, so reopening it comes back to the same choices.
     void ShowInstallOptions();
-    void Install();
+    void Install(bool save_to_sd = false, bool download_only = false);
     // one on/off entry per dlc, over the install menu. the row it was opened from
     // is handed in, since it counts what is ticked.
     void ShowAddons(const std::function<void()>& changed);

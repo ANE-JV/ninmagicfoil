@@ -417,6 +417,9 @@ struct Base : MenuBase {
     Base(u32 flags, u32 options);
     Base(const std::shared_ptr<fs::Fs>& fs, const FsEntry& fs_entry, const fs::FsPath& path, bool is_custom, u32 flags, u32 options);
 
+    auto GetActiveActions() const { return view->GetActions(); }
+    void Refresh() { RefreshViews(); }
+
     void SetFilter(const std::vector<std::string>& filter) {
         m_filter = filter;
     }

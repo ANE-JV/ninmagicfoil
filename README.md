@@ -1,156 +1,55 @@
-# Sphaira
+# NinMagicFoil
 
-A homebrew menu for the Nintendo Switch.
+Cliente para Nintendo Switch basado en **Sphaira 1.0.9**, con la marca NinMagic y una interfaz inspirada en la navegación lateral de Tinfoil. Proyecto independiente, publicado bajo GPL-3.0.
 
-[See the GBATemp thread for more details / discussion](https://gbatemp.net/threads/sphaira-hbmenu-replacement.664523/).
+## Estado
 
-[We have now have a Discord server!](https://discord.gg/pBybbdasfQ) Please use the issues tab to report bugs, as it is much easier for me to track.
+Versión inicial **0.1.0** en desarrollo. El código ya se compila para Switch; la validación de instalación en una consola real está pendiente. Esta versión no reproduce todavía todas las funciones ni todas las pantallas de Tinfoil. No se afirma compatibilidad universal con todos los juegos ni que esté resuelto el caso concreto del NSP de 14 GB.
 
-## Showcase
+## Qué incluye
 
-|                          |                          |
-:-------------------------:|:-------------------------:
-![Img](assets/screenshots/homebrew.jpg) | ![Img](assets/screenshots/games.jpg)
-![Img](assets/screenshots/appstore.jpg) | ![Img](assets/screenshots/appstore_page.jpg)
-![Img](assets/screenshots/file_browser.jpg) | ![Img](assets/screenshots/launch_options.jpg)
-![Img](assets/screenshots/themezer.jpg) | ![Img](assets/screenshots/web.jpg)
-![Img](assets/screenshots/ownfoil_main.jpg) | ![Img](assets/screenshots/ownfoil_details.jpg)
+- Menú lateral, cabecera con espacio libre y reloj, tema gris/turquesa y logo NinMagic.
+- Juegos instalados, carátulas y metadatos; explorador de archivos y paquetes NSP, NSZ, XCI y XCZ mediante el instalador de Sphaira.
+- Ownfoil: varios perfiles con URL, URL alternativa, usuario y contraseña; API nativa, índices JSON y listado HTML clásico con carpetas, búsqueda y nombres de catálogo.
+- Autenticación en el catálogo y en los archivos protegidos. Las credenciales permanecen en la configuración local de la consola y no se distribuyen con la aplicación.
+- Cola de instalaciones, partidas guardadas, cartuchos, homebrew, transferencias USB/MTP/FTP y montajes de red.
+- Actualizador propio desde las publicaciones de `ANE-JV/ninmagicfoil`, con comprobación de integridad y copia anterior.
 
-## Bug reports
+También incluye descarga autenticada a `/switch/NinMagicFoil/downloads/`, instalación del archivo descargado y acceso a **USB y red → Abrir DBI**. DBI es una aplicación externa: no se incorpora su motor; el usuario selecciona el archivo local dentro de DBI. Consulta [soporte Ownfoil y comprobaciones realizadas](docs/ownfoil-support.md).
 
-For any bug reports, please use the issues tab and explain in as much detail as possible!
+Se ha comprobado desde el PC el acceso autenticado al servidor real de referencia y las respuestas de un paquete de 14.049.497.676 bytes: cabecera NSP y rango por encima de 4 GiB correctos. Solo se leyeron 32 bytes del paquete. Esto no es una prueba de instalación en la consola.
 
-Please include:
+## Instalación
 
-- CFW type (i assume Atmosphere, but someone out there is still using Rajnx);
-- CFW version;
-- FW version;
-- The bug itself and how to reproduce it.
+Cuando haya una publicación disponible, extrae `ninmagicfoil.zip` en la raíz de la microSD. La ruta del ejecutable debe quedar así:
 
-## FTP
-
-FTP can be enabled via the network menu. It uses the same config as ftpsrv `/config/ftpsrv/config.ini`. [See here for the full list
-of all configs available](https://github.com/ITotalJustice/ftpsrv/blob/master/assets/config.ini.template).
-
-## MTP
-
-MTP can be enabled via the Network menu.
-
-## File association
-
-Sphaira has file association support. Let's say your app supports loading .png files, then you could write an association file, then when using the file browser, clicking on a .png file will launch your app along with the .png file as argv[1]. This was primarly added for rom loading support for emulators / frontends such as RetroArch, MelonDS, mGBA etc.
-
-```ini
-path=/switch/your_app.nro
-supported_extensions=jpg|png|mp4|mp3
+```
+/switch/NinMagicFoil/NinMagicFoil.nro
 ```
 
-The `path` field is optional. If left out, it will use the name of the ini to find the nro. For example, if the ini is called mgba.ini, it will try to find the nro in /switch/mgba.nro and /switch/folder/mgba.nro.
+Inícialo desde el menú homebrew. La configuración se guarda en `/config/NinMagicFoil/`. No reemplaza `hbmenu.nro`. Para configurar una tienda, abre **Servidores Ownfoil**, añade su URL y los datos de acceso, y guarda el perfil. No incluyas esos datos al publicar informes de errores.
 
-See `assets/romfs/assoc/` for more examples of file assoc entries.
+Para actualizar desde la aplicación: **Opciones → Actualizar NinMagicFoil**. Hace falta una publicación estable con el archivo exacto `ninmagicfoil.zip` y el resumen SHA-256 que proporciona GitHub. Si no existe una publicación o no se puede verificar, no reemplaza el ejecutable.
 
-## Installing (applications)
+## Compilación y comprobaciones
 
-Sphaira can install applications and mod packages (nsp, xci, nsz, xcz, msp) from various sources (sd card, gamecard, ftp, usb).
+Se incluyen scripts para devkitPro en Windows y Linux, un SDK libnx fijado y un flujo de GitHub Actions. La verificación comprueba la estructura NRO, nombre, versión, icono y contenido del paquete; no sustituye una prueba en hardware.
 
-For informantion about the install options, [see the wiki](https://github.com/ITotalJustice/sphaira/wiki/Install).
+- Windows: `tools/build-ninmagicfoil.ps1`.
+- Linux/devkitPro: `tools/build-ninmagicfoil.sh`.
+- Paquete: `tools/package-ninmagicfoil.py`.
+- Verificador: `tools/verify-ninmagicfoil.py`.
 
-### Usb (install)
+## Documentación
 
-The USB protocol is the same as tinfoil, so tools such as [ns-usbloader](https://github.com/developersu/ns-usbloader) and [fluffy](https://github.com/fourminute/Fluffy) should work with sphaira. You may also use the provided python script found [here](tools/usb_install_pc.py).
+- [Ownfoil, autenticación y modo alternativo](docs/ownfoil-support.md).
+- [Decisiones de funciones: retiradas, agrupadas y pendientes](docs/feature-decisions.md).
+- [Referencia de las pantallas observadas](docs/current-ui-reference.md).
+- [Inventario de Tinfoil](docs/tinfoil-inventory.md).
+- [Estudio de integración y compatibilidad](docs/sphaira-integration.md).
+- [Pruebas pendientes en consola](docs/hardware-validation.md).
+- [Procedencia y licencias](docs/provenance.md).
 
-### Ftp (install)
+## Créditos
 
-Once you have connected your ftp client to your switch, you can upload files to install into the `install` folder.
-
-### Usb HDD (install)
-
-Connected USB mass storage devices show up in the file browser (and as a dump location) under `mounts:/`,
-installing from them works the same as installing from the sd card.
-
-Supported filesystems are FAT12/16/32, exFAT and NTFS. NTFS is provided by
-[NTFS-3G](https://github.com/tuxera/ntfs-3g) and can be turned off at build time with `-DENABLE_NTFS=OFF`.
-EXT2/3/4 is supported as well but off by default, enable it with `-DENABLE_EXT4=ON`.
-
-A few NTFS notes:
-
-- Always eject the drive properly on Windows. If the journal is left dirty, sphaira replays it on mount, but only
-  when `HDD write protect` is off.
-- A drive left behind by Windows fast startup / hibernation is not mounted by default. `Mount hibernated NTFS`
-  in the HDD options forces it, at the cost of the saved Windows session.
-- NTFS is noticeably slower than exFAT. For installing large files, exFAT is the better choice.
-
-### Ownfoil (install)
-
-[Ownfoil](https://github.com/a1ex4/ownfoil) is a self-hosted Nintendo Switch library manager, automating library curation tasks and making backups available to install directly on your console.
-
-Local servers are found automatically on the network, so there is no ip or port to type in. Each server can have both a local and a remote address, over http or https, and signs in with a user account.
-
-The library is browsed by *content*, not by files: pick a game, a version and the dlc you want, and Sphaira works out which files it needs, however they are bundled (several nsp, or a multi content nsp / xci).  
-Only what you picked is downloaded and installed. nsp, nsz, xci and xcz are supported, and a download survives a broken connection, resuming for up to 60s.
-
-Entries are listed under `New games`, `Updates`, `DLC`, `All games` and `Search`, paginated and sortable. All artwork is served by the Ownfoil server, so the switch never connects to Nintendo's servers.
-
-## Building from source
-
-You will first need to install [devkitPro](https://devkitpro.org/wiki/Getting_Started).
-
-Next you will need to install the dependencies:
-```sh
-sudo pacman -S switch-dev deko3d switch-cmake switch-curl switch-glm switch-zlib switch-mbedtls switch-ntfs-3g
-```
-
-`switch-ntfs-3g` is only needed for NTFS support on USB HDDs, configure with `-DENABLE_NTFS=OFF` to build without it.
-For EXT2/3/4 support (`-DENABLE_EXT4=ON`) you also need `switch-lwext4`.
-
-Also you need to have on your environment the packages `git`, `make`, `zip` and `cmake`
-
-Once devkitPro and all dependencies are installed, you can now build sphaira.
-
-```sh
-git clone https://github.com/ITotalJustice/sphaira.git
-cd sphaira
-cmake --preset MinSizeRel
-cmake --build --preset MinSizeRel
-```
-
-The output will be found in `build/MinSizeRel/sphaira.nro`
-
-### Using Docker
-
-If you would rather not install and manage devkitPro on your machine, the nro can be built in a docker container instead, with the following tool:
-
-```sh
-tools/nro-builder/build.sh [Release|Dev|Lite] [--send]
-```
-
-The first run builds the image, which holds the same devkitA64 toolchain the release workflow uses, plus ninja and ccache.
-The first build takes longer but after that only what you changed is compiled.
-
-`Release` is the default and is what the release workflow publishes. `Dev` skips LTO, so a one file change is immediate.
-
-The output will be found in `build/<preset>/sphaira.nro`. Add `--send` to send it straight to the console over `nxlink` (enable it in the Network options) and follow its log.
-
-## Credits
-
-- [borealis](https://github.com/natinusala/borealis)
-- [stb](https://github.com/nothings/stb)
-- [yyjson](https://github.com/ibireme/yyjson)
-- [nx-hbmenu](https://github.com/switchbrew/nx-hbmenu)
-- [nx-hbloader](https://github.com/switchbrew/nx-hbloader)
-- [deko3d-nanovg](https://github.com/Adubbz/nanovg-deko3d)
-- [libpulsar](https://github.com/p-sam/switch-libpulsar)
-- [minIni](https://github.com/compuphase/minIni)
-- [GBATemp](https://gbatemp.net/threads/sphaira-hbmenu-replacement.664523/)
-- [hb-appstore](https://github.com/fortheusers/hb-appstore)
-- [haze](https://github.com/Atmosphere-NX/Atmosphere/tree/master/troposphere/haze)
-- [nxdumptool](https://github.com/DarkMatterCore/nxdumptool) (for gamecard bin dumping and rsa verify code)
-- [Liam0](https://github.com/ThatNerdyPikachu/switch-010editor-templates) (for ticket / cert structs)
-- [libusbhsfs](https://github.com/DarkMatterCore/libusbhsfs)
-- [libnxtc](https://github.com/DarkMatterCore/libnxtc)
-- [oss-nvjpg](https://github.com/averne/oss-nvjpg)
-- [nsz](https://github.com/nicoboss/nsz)
-- [themezer](https://themezer.net/)
-- [nx-versions](https://github.com/16BitWonder/nx-versions)
-- [NX-Update-Checker](https://github.com/16BitWonder/NX-Update-Checker)
-- Everyone who has contributed to this project!
+NinMagicFoil conserva el código y los avisos de Sphaira y de sus dependencias. Base fijada: [NaGaa95/sphaira, versión 1.0.9](https://github.com/NaGaa95/sphaira/tree/1.0.9), commit `dce51b626551ee0d3df0bbec3d335140ba6d0ccf`. El logotipo NinMagic fue proporcionado por el propietario del proyecto. Consulta [LICENSE](LICENSE).

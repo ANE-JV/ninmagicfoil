@@ -1,0 +1,21 @@
+Notices preserved from linked upstream components:
+
+deko3d 0.5.0:
+https://raw.githubusercontent.com/devkitPro/deko3d/v0.5.0/LICENSE
+
+curl 7.69.1:
+https://raw.githubusercontent.com/curl/curl/curl-7_69_1/COPYING
+
+GLM 0.9.9.7:
+https://raw.githubusercontent.com/g-truc/glm/0.9.9.7/copying.txt
+
+ftpsrv commit 7c82402: source-file copyright and SPDX MIT identifier.
+https://github.com/ITotalJustice/ftpsrv/tree/7c82402
+
+Mozilla Public License 2.0 for the embedded Mozilla/curl CA certificate data:
+https://www.mozilla.org/media/MPL/2.0/index.815ca599c9df.txt
+Bundle provenance and whole-file hash are in assets/cacert-provenance.md.
+
+The release packager also includes licenses directly from the fetched,
+pinned dependency sources, the pinned libnx source, and the selected SDK
+portlibs. The ZIP build-info.json records their available source revisions.

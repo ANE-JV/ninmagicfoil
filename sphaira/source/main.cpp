@@ -3,7 +3,7 @@
 #include "app.hpp"
 #include "log.hpp"
 #include "owo.hpp"
-#include "ui/menus/main_menu.hpp"
+#include "ui/menus/ninmagic_menu.hpp"
 #include "utils/core.hpp"
 
 int main(int argc, char** argv) {
@@ -16,7 +16,7 @@ int main(int argc, char** argv) {
     }
 
     auto app = std::make_unique<sphaira::App>(argv[0]);
-    app->Push<sphaira::ui::menu::main::MainMenu>();
+    app->Push<sphaira::ui::menu::ninmagic::Menu>();
     app->Loop();
     return 0;
 }

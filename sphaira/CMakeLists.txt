@@ -35,7 +35,7 @@ option(ENABLE_DEVOPTAB_WEBDAV "" ON)
 # it also adds 230k to binary size, and i don't think anyone will use it.
 option(ENABLE_DEVOPTAB_SFTP "" OFF)
 
-set(sphaira_VERSION 1.0.9)
+set(sphaira_VERSION 0.1.0)
 
 project(sphaira
     VERSION ${sphaira_VERSION}
@@ -84,6 +84,9 @@ add_executable(sphaira
     source/ui/menus/homebrew.cpp
     source/ui/menus/irs_menu.cpp
     source/ui/menus/main_menu.cpp
+    source/ui/menus/ninmagic_menu.cpp
+    source/ninmagic_updater.cpp
+    source/ninmagic_tls.cpp
     source/ui/menus/menu_base.cpp
     source/ui/menus/save_menu.cpp
     source/ui/menus/storage_menu.cpp
@@ -402,7 +405,7 @@ if (ENABLE_FTPSRV)
         GIT_REPOSITORY https://github.com/ITotalJustice/ftpsrv.git
         GIT_TAG 7c82402
         SOURCE_SUBDIR NONE
-        PATCH_COMMAND "${GIT_EXECUTABLE}" apply --ignore-whitespace "${CMAKE_SOURCE_DIR}/cmake/patches/ftpsrv-upload-callback.patch"
+        PATCH_COMMAND "${CMAKE_COMMAND}" -DGIT_EXECUTABLE=${GIT_EXECUTABLE} -DPATCH_FILE=${CMAKE_SOURCE_DIR}/cmake/patches/ftpsrv-upload-callback.patch -P ${CMAKE_SOURCE_DIR}/cmake/ApplyGitPatch.cmake
     )
 
     FetchContent_MakeAvailable(ftpsrv)
@@ -717,27 +720,27 @@ target_compile_options(sphaira PRIVATE
 # create nacp
 nx_generate_nacp(
     OUTPUT sphaira.nacp
-    NAME ${CMAKE_PROJECT_NAME}
-    AUTHOR TotalJustice
+    NAME NinMagicFoil
+    AUTHOR NinMagic
     VERSION ${sphaira_VERSION}
 )
 
 # create nro
 nx_create_nro(sphaira
-    OUTPUT ${CMAKE_BINARY_DIR}/sphaira.nro
+    OUTPUT ${CMAKE_BINARY_DIR}/NinMagicFoil.nro
     ICON ${CMAKE_SOURCE_DIR}/assets/icon.jpg
     NACP sphaira.nacp
     ROMFS sphaira_romfs
 )
 
-file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/switch/sphaira)
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/switch/NinMagicFoil)
 
 add_custom_command(
     TARGET sphaira_nro POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy
-        ${CMAKE_BINARY_DIR}/sphaira.nro
-        ${CMAKE_BINARY_DIR}/switch/sphaira/sphaira.nro
+        ${CMAKE_BINARY_DIR}/NinMagicFoil.nro
+        ${CMAKE_BINARY_DIR}/switch/NinMagicFoil/NinMagicFoil.nro
 )
 
-message(STATUS "generating nro in: ${CMAKE_BINARY_DIR}/sphaira.nro")
-message(STATUS "run nxlink -s ${CMAKE_BINARY_DIR}/sphaira.nro")
+message(STATUS "generating nro in: ${CMAKE_BINARY_DIR}/NinMagicFoil.nro")
+message(STATUS "run nxlink -s ${CMAKE_BINARY_DIR}/NinMagicFoil.nro")

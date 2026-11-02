@@ -124,6 +124,10 @@ Menu::Menu(u32 flags) : grid::Menu{"Ownfoil"_i18n, flags} {
             m_connecting = false;
             return;
         }
+        if (!m_directory_stack.empty() && m_mode == Mode::Home) {
+            GoUp();
+            return;
+        }
         SetPop();
     }});
 
@@ -151,7 +155,7 @@ Menu::Menu(u32 flags) : grid::Menu{"Ownfoil"_i18n, flags} {
         ShowOptions();
     }});
 
-    m_list = std::make_unique<List>(1, 4, LIST_POS, LIST_ITEM, LIST_PAD);
+    LayoutServerList();
 
     if (m_view.Get() < 0 || m_view.Get() >= ViewType_Count) {
         m_view.Set(ViewType_Icon);
@@ -219,7 +223,7 @@ void Menu::SetMode(Mode mode) {
             SetTitle("Ownfoil"_i18n);
             SetTitleSubHeading("");
             SetSubHeading("");
-            m_list = std::make_unique<List>(1, 4, LIST_POS, LIST_ITEM, LIST_PAD);
+            LayoutServerList();
         }
     }
 }
@@ -260,6 +264,24 @@ void Menu::OnViewChange() {
     m_entry_index = 0;
     m_banner_name.Reset();
     m_banner_publisher.Reset();
+
+    if (IsEmbedded()) {
+        const auto x = m_pos.x + 12.f;
+        const auto y = m_pos.y + 38.f;
+        const auto width = m_pos.w - 24.f;
+        const Vec4 body{x, y, width, m_pos.h - 38.f};
+        const Vec2 pad{10.f, 10.f};
+        if (m_view.Get() == ViewType_Icon) {
+            const auto w = (width - 50.f) / 6.f;
+            m_list = std::make_unique<List>(6, 18, body, Vec4{x, y + 6.f, w, w + 29.f}, pad);
+        } else if (m_view.Get() == ViewType_Detail) {
+            m_list = std::make_unique<List>(2, 6, body, Vec4{x, y, (width - 10.f) / 2.f, 155.f}, pad);
+        } else {
+            m_list = std::make_unique<List>(2, 4, body, Vec4{x, y, (width - 10.f) / 2.f, 232.f}, pad);
+        }
+        m_list->SetPageJump(false);
+        return;
+    }
 
     switch (m_view.Get()) {
         case ViewType_Icon:
@@ -332,7 +354,7 @@ void Menu::Update(Controller* controller, TouchInfo* touch) {
     }
 
     // taken before the list, whose touch bounds are the whole menu body.
-    if (touch->is_clicked && touch->in_range(DISCOVER_BUTTON)) {
+    if (touch->is_clicked && touch->in_range(DiscoverButton())) {
         m_focus_discover = true;
         FireAction(Button::A);
         return;
@@ -376,9 +398,16 @@ void Menu::Update(Controller* controller, TouchInfo* touch) {
 void Menu::Draw(NVGcontext* vg, Theme* theme) {
     MenuBase::Draw(vg, theme);
 
+    nvgSave(vg);
+    ON_SCOPE_EXIT(nvgRestore(vg));
+    if (IsEmbedded()) {
+        nvgIntersectScissor(vg, m_pos.x, m_pos.y, m_pos.w, m_pos.h);
+    }
+    const auto center_x = m_pos.x + m_pos.w / 2.f;
+    const auto center_y = m_pos.y + m_pos.h / 2.f;
     const auto pdata = GetPolledData();
     if (!pdata.ip) {
-        gfx::drawTextArgs(vg, SCREEN_WIDTH / 2.f, SCREEN_HEIGHT / 2.f, 36.f, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE, theme->GetColour(ThemeEntryID_TEXT_INFO), "%s", "Network access required"_i18n.c_str());
+        gfx::drawTextArgs(vg, center_x, center_y, 24.f, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE, theme->GetColour(ThemeEntryID_TEXT_INFO), "%s", "Network access required"_i18n.c_str());
         return;
     }
 
@@ -388,13 +417,13 @@ void Menu::Draw(NVGcontext* vg, Theme* theme) {
     }
 
     if (m_connecting) {
-        gfx::drawTextArgs(vg, SCREEN_WIDTH / 2.f, LIST_POS.y + LIST_POS.h / 2.f, 24.f, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE, theme->GetColour(ThemeEntryID_TEXT_INFO), "%s",
+        gfx::drawTextArgs(vg, center_x, center_y, 24.f, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE, theme->GetColour(ThemeEntryID_TEXT_INFO), "%s",
             (i18n::Reorder("Connecting to ", m_connecting_name) + "...").c_str());
         return;
     }
 
     if (m_candidates.empty()) {
-        gfx::drawTextArgs(vg, SCREEN_WIDTH / 2.f, LIST_POS.y + LIST_POS.h / 2.f, 24.f, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE, theme->GetColour(ThemeEntryID_TEXT_INFO), "%s",
+        gfx::drawTextArgs(vg, center_x, center_y, 24.f, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE, theme->GetColour(ThemeEntryID_TEXT_INFO), "%s",
             "No Ownfoil servers saved.\n\nPress X to add one by hand, or search the network below."_i18n.c_str());
     } else {
         m_list->Draw(vg, theme, m_candidates.size(), [this](NVGcontext* vg, Theme* theme, const Vec4& v, s64 index) {
@@ -445,8 +474,14 @@ void Menu::Draw(NVGcontext* vg, Theme* theme) {
 }
 
 void Menu::DrawHome(NVGcontext* vg, Theme* theme) {
+    if (IsEmbedded()) {
+        const auto status = m_config.name + SEPARATOR + i18n::get(CATEGORIES[m_category].name)
+            + SEPARATOR + std::to_string(m_page + 1) + " / " + std::to_string(GetPageMax());
+        gfx::drawTextArgs(vg, m_pos.x + 12.f, m_pos.y + 18.f, 16.f, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE,
+            theme->GetColour(ThemeEntryID_TEXT_INFO), "%s", status.c_str());
+    }
     if (m_entries.empty()) {
-        gfx::drawTextArgs(vg, SCREEN_WIDTH / 2.f, SCREEN_HEIGHT / 2.f, 30.f, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE, theme->GetColour(ThemeEntryID_TEXT_INFO), "%s", "Empty..."_i18n.c_str());
+        gfx::drawTextArgs(vg, m_pos.x + m_pos.w / 2.f, m_pos.y + m_pos.h / 2.f, 24.f, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE, theme->GetColour(ThemeEntryID_TEXT_INFO), "%s", "Empty..."_i18n.c_str());
         return;
     }
 
@@ -468,15 +503,26 @@ void Menu::DrawHome(NVGcontext* vg, Theme* theme) {
 
             const auto text_id = selected ? ThemeEntryID_TEXT_SELECTED : ThemeEntryID_TEXT;
             const auto info_id = selected ? ThemeEntryID_TEXT_SELECTED : ThemeEntryID_TEXT_INFO;
-            const auto xoff = (BANNER_ITEM.w - BANNER_W) / 2.f;
+            const auto image_h = IsEmbedded() ? h - 65.f : BANNER_H;
+            const auto image_w = image_h * (16.f / 9.f);
+            const auto xoff = (w - image_w) / 2.f;
             const auto image = GetImage(e, true, budget);
 
-            gfx::drawImage(vg, x + xoff, y, BANNER_W, BANNER_H, image ? image : App::GetDefaultImage(), 5.f);
-            m_banner_name.Draw(vg, selected, x + xoff, y + BANNER_H + 20.f, w - 30.f - xoff, 18.f, NVG_ALIGN_LEFT, theme->GetColour(text_id), e.app.name.c_str());
-            m_banner_publisher.Draw(vg, selected, x + xoff, y + BANNER_H + 55.f, w - 30.f - xoff, 18.f, NVG_ALIGN_LEFT, theme->GetColour(info_id), e.app.publisher.c_str());
+            gfx::drawImage(vg, x + xoff, y, image_w, image_h, image ? image : App::GetDefaultImage(), 5.f);
+            m_banner_name.Draw(vg, selected, x + 12.f, y + image_h + 22.f, w - 24.f, 18.f, NVG_ALIGN_LEFT, theme->GetColour(text_id), e.app.name.c_str());
+            m_banner_publisher.Draw(vg, selected, x + 12.f, y + image_h + 51.f, w - 24.f, 16.f, NVG_ALIGN_LEFT, theme->GetColour(info_id), e.app.publisher.c_str());
             return;
         }
 
+        if (IsEmbedded() && view == ViewType_Icon) {
+            const Vec4 icon{x, y, w, w};
+            if (selected) gfx::drawRectOutline(vg, theme, 3.f, v);
+            const auto image = GetImage(e, false, budget);
+            gfx::drawImage(vg, icon, image ? image : App::GetDefaultImage(), 4.f);
+            m_banner_name.Draw(vg, selected, x + 3.f, y + w + 19.f, w - 6.f, 14.f,
+                NVG_ALIGN_LEFT, theme->GetColour(ThemeEntryID_TEXT), e.app.name.c_str());
+            return;
+        }
         const auto layout = view == ViewType_Detail ? grid::LayoutType_GridDetail : grid::LayoutType_Grid;
         DrawEntry(vg, theme, layout, v, selected, GetImage(e, false, budget), e.app.name.c_str(), e.app.publisher.c_str(), e.app.version.c_str());
     });
@@ -580,18 +626,77 @@ auto Menu::GetImage(Entry& e, bool banner, int& budget) -> int {
     return image.image;
 }
 
+void Menu::LayoutServerList() {
+    if (IsEmbedded()) {
+        const Vec4 area{m_pos.x + 12.f, m_pos.y + 10.f, m_pos.w - 24.f, m_pos.h - 90.f};
+        m_list = std::make_unique<List>(1, 4, area, Vec4{area.x, area.y, area.w, 90.f}, LIST_PAD);
+    } else {
+        m_list = std::make_unique<List>(1, 4, LIST_POS, LIST_ITEM, LIST_PAD);
+    }
+}
+
+auto Menu::DiscoverButton() const -> Vec4 {
+    return IsEmbedded() ? Vec4{m_pos.x + 12.f, m_pos.y + m_pos.h - 68.f, m_pos.w - 24.f, 56.f} : DISCOVER_BUTTON;
+}
+
 void Menu::DrawDiscoverButton(NVGcontext* vg, Theme* theme) const {
-    gfx::drawRect(vg, DISCOVER_BUTTON, theme->GetColour(ThemeEntryID_SELECTED_BACKGROUND), 5.f);
+    const auto button = DiscoverButton();
+    gfx::drawRect(vg, button, theme->GetColour(ThemeEntryID_SELECTED_BACKGROUND), 5.f);
 
     if (m_focus_discover) {
-        gfx::drawRectOutline(vg, theme, 4.f, DISCOVER_BUTTON);
+        gfx::drawRectOutline(vg, theme, 4.f, button);
     }
 
     // greyed out for the duration of the scan: it can't be started twice.
     const auto colour_id = m_discovering ? ThemeEntryID_TEXT_INFO : (m_focus_discover ? ThemeEntryID_TEXT_SELECTED : ThemeEntryID_TEXT);
     const auto text = m_discovering ? "Searching the network..."_i18n : "Discover local servers"_i18n;
 
-    gfx::drawTextArgs(vg, DISCOVER_BUTTON.x + DISCOVER_BUTTON.w / 2.f, DISCOVER_BUTTON.y + DISCOVER_BUTTON.h / 2.f, 22.f, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE, theme->GetColour(colour_id), "%s", text.c_str());
+    gfx::drawTextArgs(vg, button.x + button.w / 2.f, button.y + button.h / 2.f, 22.f, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE, theme->GetColour(colour_id), "%s", text.c_str());
+}
+
+void Menu::SelectCategory(sphaira::ownfoil::api::Category category, bool prompt_search) {
+    const auto found = std::find_if(std::begin(CATEGORIES), std::end(CATEGORIES),
+        [category](const auto& item) { return item.category == category; });
+    if (found == std::end(CATEGORIES)) return;
+    const auto index = static_cast<s64>(found - std::begin(CATEGORIES));
+    if (category == sphaira::ownfoil::api::Category::Search && prompt_search) {
+        ShowSearch(index);
+        return;
+    }
+    const auto changed = m_category != index;
+    m_category = index;
+    if (m_connecting || m_base_url.empty()) return;
+    if (changed || m_mode != Mode::Home) {
+        FreeEntries();
+        m_pending_page.reset();
+        SetMode(Mode::Home);
+        SetCatalogTitle();
+        LoadPage(0);
+    }
+}
+
+void Menu::GoUp() {
+    if (m_directory_stack.empty()) return;
+    m_base_url = m_directory_stack.back();
+    m_directory_stack.pop_back();
+    FreeEntries();
+    m_pending_page.reset();
+    LoadPage(0);
+}
+
+void Menu::ShowServers() {
+    m_did_initial_setup = true;
+    m_connect_stop.request_stop();
+    m_connecting = false;
+    ReloadSaved();
+    SetMode(Mode::ServerList);
+}
+
+void Menu::AddServer() {
+    App::Push<sphaira::ownfoil::OwnfoilForm>(sphaira::ownfoil::Config{}, [this](const auto& saved) {
+        ReloadSaved();
+        ConnectTo(saved);
+    });
 }
 
 void Menu::OnFocusGained() {
@@ -659,7 +764,7 @@ void Menu::RebuildCandidates() {
         // the case the handshake can't cover: a local-only shop whose ip moved is
         // unreachable, so no handshake ever happens to correct the entry.
         // discovery's fresher address gets the connect through, which saves it.
-        if (const auto d = FindDiscovered(config.uid)) {
+        if (const auto d = FindDiscovered(config.server_uid.empty() ? config.uid : config.server_uid)) {
             candidate.version = d->version;
             candidate.is_public = d->is_public;
             if (!d->local.empty()) {
@@ -752,10 +857,7 @@ void Menu::ConnectTo(const sphaira::ownfoil::Config& config) {
         return;
     }
 
-    // opening a shop asks what it can add to this console, so that is what it
-    // opens on rather than wherever the last one was left.
-    m_category = 0;
-    m_search.clear();
+    // The shell owns the requested category; connecting must preserve it.
     m_installs_shown = g_installs;
 
     // read here rather than on the worker: option::Get() fills its cache on the
@@ -776,6 +878,8 @@ void Menu::ConnectTo(const sphaira::ownfoil::Config& config) {
     m_connect_async = std::make_unique<utils::Async>([this, config, query, token](){
         auto connect_result = sphaira::ownfoil::api::Connect(config, token);
         auto connected_config = config;
+        connected_config.json_index = connect_result.json_index;
+        connected_config.legacy_html = connect_result.legacy_html;
         bool saved_changed{};
         std::vector<sphaira::ownfoil::api::ShopApp> fetched;
         std::string fetch_error;
@@ -788,9 +892,9 @@ void Menu::ConnectTo(const sphaira::ownfoil::Config& config) {
             // gave.
             const auto& info = connect_result.info;
             if (!info.uid.empty()) {
-                connected_config.uid = info.uid;
+                connected_config.server_uid = info.uid;
             }
-            if (!info.name.empty()) {
+            if (connected_config.name.empty() && !info.name.empty()) {
                 connected_config.name = info.name;
             }
             // no local address: that is discovery's alone (RebuildCandidates).
@@ -803,7 +907,7 @@ void Menu::ConnectTo(const sphaira::ownfoil::Config& config) {
             // written here, on the worker: minIni rewrites the whole file once
             // per key, so saving an entry is half a dozen SD writes and they
             // have no business landing on the main thread as the grid appears.
-            if (connected_config.uid != config.uid || connected_config.name != config.name
+            if (connected_config.server_uid != config.server_uid || connected_config.name != config.name
                 || connected_config.remote_address != config.remote_address
                 || connected_config.resolved_url != config.resolved_url) {
                 // the old uid re-keys the entry: a placeholder promoted on first
@@ -819,14 +923,14 @@ void Menu::ConnectTo(const sphaira::ownfoil::Config& config) {
                 // for every user whether or not they ever open this tab.
                 fs::FsNativeSd().CreateDirectoryRecursively(CACHE_PATH);
                 auto page_query = query;
-                if (PrepareQuery(page_query, base_url, config, token, fetch_error)) {
-                    sphaira::ownfoil::api::FetchApps(base_url, config, token, page_query, fetched, total, fetch_error);
+                if (PrepareQuery(page_query, base_url, connected_config, token, fetch_error)) {
+                    sphaira::ownfoil::api::FetchApps(base_url, connected_config, token, page_query, fetched, total, fetch_error);
                 }
             }
         }
 
         evman::push(evman::CallbackEventData{
-            [this, config, connect_result = std::move(connect_result), connected_config = std::move(connected_config),
+            [this, config, query, connect_result = std::move(connect_result), connected_config = std::move(connected_config),
                 saved_changed, fetched = std::move(fetched), fetch_error = std::move(fetch_error), total, base_url = std::move(base_url)]() mutable {
                 m_connecting = false;
 
@@ -861,8 +965,13 @@ void Menu::ConnectTo(const sphaira::ownfoil::Config& config) {
                 }
 
                 m_base_url = base_url;
+                m_directory_stack.clear();
                 SetMode(Mode::Home);
                 ApplyPage(0, fetched, total);
+                if (query.category != CATEGORIES[m_category].category || query.search != m_search) {
+                    FreeEntries();
+                    LoadPage(0);
+                }
             },
             token
         }, false);
@@ -1114,8 +1223,13 @@ void Menu::ShowSearch(s64 index) {
 
     m_search = term;
     m_category = index;
-    SetCatalogTitle();
-    LoadPage(0);
+    if (!m_base_url.empty() && !m_connecting) {
+        FreeEntries();
+        m_pending_page.reset();
+        SetMode(Mode::Home);
+        SetCatalogTitle();
+        LoadPage(0);
+    }
 }
 
 void Menu::ShowOptions() {
@@ -1136,9 +1250,7 @@ void Menu::ShowOptions() {
 
     if (m_mode == Mode::ServerList) {
         options->Add<SidebarEntryCallback>("Add server"_i18n, [this](){
-            App::Push<sphaira::ownfoil::OwnfoilForm>(sphaira::ownfoil::Config{}, [this](const auto&){
-                ReloadSaved();
-            });
+            AddServer();
         }, true, "Add a server."_i18n);
 
         // not on Y: MainMenu claims it for its menu picker while this is a tab.
@@ -1208,8 +1320,7 @@ void Menu::ShowOptions() {
 
         // last: it leaves the catalog, where everything above adjusts it.
         options->Add<SidebarEntryCallback>("Servers list"_i18n, [this](){
-            RebuildCandidates();
-            SetMode(Mode::ServerList);
+            ShowServers();
         }, true, "Return to the server list."_i18n);
     }
 
@@ -1246,6 +1357,18 @@ void Menu::OpenSelected() {
 
     using AppType = sphaira::ownfoil::api::AppType;
     const auto& app = m_entries[m_entry_index].app;
+    if (app.directory) {
+        if (!sphaira::ownfoil::IsSameOrigin(m_base_url, app.download.url)) {
+            App::Notify("Configure a separate profile for a directory on another server."_i18n);
+            return;
+        }
+        m_directory_stack.push_back(m_base_url);
+        m_base_url = app.download.url;
+        FreeEntries();
+        m_pending_page.reset();
+        LoadPage(0);
+        return;
+    }
 
     // an update has no page of its own, so its card opens its game's - which is
     // whose name, publisher and artwork the card already carries.

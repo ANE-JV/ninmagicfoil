@@ -32,6 +32,8 @@
 #include "i18n.hpp"
 #include "threaded_file_transfer.hpp"
 #include "nacp_compat.hpp"
+#include "ninmagic_updater.hpp"
+#include "evman.hpp"
 
 #include <cstring>
 #include <yyjson.h>
@@ -44,16 +46,6 @@
 
 namespace sphaira::ui::menu::main {
 namespace {
-
-constexpr const char* GITHUB_URL{"https://api.github.com/repos/NaGaa95/sphaira/releases/latest"};
-constexpr fs::FsPath CACHE_PATH{"/switch/sphaira/cache/sphaira_latest.json"};
-
-// paths where sphaira can be installed, used when updating
-constexpr const fs::FsPath SPHAIRA_PATHS[]{
-    "/hbmenu.nro",
-    "/switch/sphaira.nro",
-    "/switch/sphaira/sphaira.nro",
-};
 
 auto Trim(std::string_view value) -> std::string_view {
     while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
@@ -71,20 +63,6 @@ auto Lower(std::string_view value) -> std::string {
         return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     });
     return result;
-}
-
-auto EndsWithCaseInsensitive(std::string_view value, std::string_view suffix) -> bool {
-    return value.size() >= suffix.size()
-        && !strncasecmp(value.data() + value.size() - suffix.size(), suffix.data(), suffix.size());
-}
-
-auto IsSphairaNacp(const NacpStruct& nacp) -> bool {
-    for (const auto& language : NacpLanguageEntries(nacp)) {
-        if (!strncasecmp(language.name, "sphaira", 7)) {
-            return true;
-        }
-    }
-    return false;
 }
 
 auto ReadNotes(yyjson_val* value) -> std::string {
@@ -339,7 +317,7 @@ const MiscMenuEntry MISC_MENU_ENTRIES[] = {
 
     { .name = "GitHub", .title = "GitHub", .func = MiscMenuFuncGenerator<ui::menu::gh::Menu>, .flag = MiscMenuFlag_Shortcut, .info =
         "Download releases directly from GitHub. "
-        "Custom entries can be added to /config/sphaira/github" },
+        "Custom entries can be added to /config/NinMagicFoil/github" },
 
     { .name = "Ownfoil", .title = "Ownfoil", .func = MiscMenuFuncGenerator<ui::menu::ownfoil::Menu>, .flag = MiscMenuFlag_Shortcut, .info =
         "Browse and install titles from a self-hosted Ownfoil server.\n\n"
@@ -368,122 +346,6 @@ const MiscMenuEntry MISC_MENU_ENTRIES[] = {
     { .name = "IRS", .title = "IRS (Infrared Joycon Camera)", .func = MiscMenuFuncGenerator<ui::menu::irs::Menu>, .flag = MiscMenuFlag_Shortcut, .info =
         "InfraRed Sensor (IRS) is the small camera found on right JoyCon." },
 };
-
-auto InstallUpdate(ProgressBox* pbox, const std::string url, const std::string version) -> Result {
-    static const fs::FsPath zip_out{"/switch/sphaira/cache/update.zip"};
-    static const fs::FsPath staged_nro{"/switch/sphaira/cache/update.nro.tmp"};
-    static const fs::FsPath backup_nro{"/switch/sphaira/cache/update.nro.backup"};
-
-    fs::FsNativeSd fs;
-    R_TRY(fs.GetFsOpenResult());
-
-    const auto exe_path = App::GetExePath();
-    const bool direct_nro = EndsWithCaseInsensitive(url, ".nro");
-    const auto& download_path = direct_nro ? staged_nro : zip_out;
-    fs.DeleteFile(staged_nro);
-    fs.DeleteFile(zip_out);
-    fs.DeleteFile(backup_nro);
-    ON_SCOPE_EXIT({
-        fs.DeleteFile(staged_nro);
-        fs.DeleteFile(zip_out);
-    });
-
-    // 1. Download to a staging path. Never overwrite the running executable
-    // before the complete update has been validated.
-    if (!pbox->ShouldExit()) {
-        pbox->NewTransfer(i18n::Reorder("Downloading ", version));
-        log_write("starting download: %s\n", url.c_str());
-
-        const auto result = curl::Api().ToFile(
-            curl::Url{url},
-            curl::Path{download_path},
-            curl::OnProgress{pbox->OnDownloadProgressCallback()}
-        );
-
-        R_UNLESS(result.success, Result_MainFailedToDownloadUpdate);
-    }
-    R_TRY(pbox->ShouldExitResult());
-
-    // 2. Extract only sphaira.nro from archives. Other release files cannot
-    // write to arbitrary SD-card paths during self-update.
-    bool found_exe{direct_nro};
-    if (!direct_nro) {
-        R_TRY(thread::TransferUnzipAll(pbox, zip_out, &fs, "/", [&](const fs::FsPath& name, fs::FsPath& path) -> bool {
-            if (name.ends_with("sphaira.nro")) {
-                path = staged_nro;
-                found_exe = true;
-                return true;
-            }
-            return false;
-        }));
-    }
-    R_TRY(pbox->ShouldExitResult());
-    R_UNLESS(found_exe, Result_MainFailedToDownloadUpdate);
-
-    // 3. Validate the embedded NACP and expected release version.
-    NacpStruct staged_nacp{};
-    R_UNLESS(R_SUCCEEDED(nro_get_nacp(staged_nro, staged_nacp)), Result_MainDownloadedUpdateInvalid);
-    R_UNLESS(IsSphairaNacp(staged_nacp), Result_MainDownloadedUpdateInvalid);
-    const auto expected_version = App::GetVersionFromString(version.c_str());
-    const auto staged_version = App::GetVersionFromString(staged_nacp.display_version);
-    R_UNLESS(staged_version && (!expected_version || staged_version == expected_version), Result_MainDownloadedUpdateInvalid);
-
-    // 4. Keep a recovery copy while replacing the running NRO.
-    pbox->NewTransfer("Backing up current version"_i18n);
-    R_TRY(pbox->CopyFile(&fs, exe_path, backup_nro));
-    pbox->NewTransfer("Installing validated update"_i18n);
-    const auto install_result = pbox->CopyFile(&fs, staged_nro, exe_path);
-    if (R_FAILED(install_result)) {
-        log_write("[UPD] install failed, restoring backup\n");
-        const auto restore_result = pbox->CopyFile(&fs, backup_nro, exe_path);
-        if (R_FAILED(restore_result)) {
-            log_write("[UPD] backup restore failed: 0x%X\n", R_VALUE(restore_result));
-        }
-        R_THROW(Result_MainFailedToInstallUpdate);
-    }
-
-    // Read the file back from its final location before deleting the backup.
-    // This catches interrupted or corrupted SD-card writes while recovery is
-    // still possible.
-    NacpStruct installed_nacp{};
-    const auto installed_nacp_result = nro_get_nacp(exe_path, installed_nacp);
-    const auto installed_version = R_SUCCEEDED(installed_nacp_result)
-        ? App::GetVersionFromString(installed_nacp.display_version)
-        : 0;
-    if (R_FAILED(installed_nacp_result) || !IsSphairaNacp(installed_nacp) || installed_version != staged_version) {
-        log_write("[UPD] installed update failed verification, restoring backup\n");
-        const auto restore_result = pbox->CopyFile(&fs, backup_nro, exe_path);
-        if (R_FAILED(restore_result)) {
-            log_write("[UPD] backup restore failed: 0x%X\n", R_VALUE(restore_result));
-        }
-        R_THROW(Result_MainFailedToInstallUpdate);
-    }
-    fs.DeleteFile(backup_nro);
-
-    // 5. Update known secondary installations, but only when their NACP
-    // identifies them as Sphaira.
-    for (const auto& path : SPHAIRA_PATHS) {
-        if (exe_path == path) {
-            continue;
-        }
-        NacpStruct nacp{};
-        if (R_SUCCEEDED(nro_get_nacp(path, nacp))) {
-            if (IsSphairaNacp(nacp)) {
-                pbox->NewTransfer(path);
-                const auto secondary_result = pbox->CopyFile(&fs, staged_nro, path);
-                if (R_FAILED(secondary_result)) {
-                    // The active installation is already valid. A stale or
-                    // locked secondary copy must not turn that success into a
-                    // failed update.
-                    log_write("[UPD] failed to update secondary path %s: 0x%X\n", path.s, R_VALUE(secondary_result));
-                }
-            }
-        }
-    }
-
-    log_write("finished update :)\n");
-    R_SUCCEED();
-}
 
 auto CreateCenterMenu(std::string& name_out) -> std::unique_ptr<MenuBase> {
     const auto name = App::GetApp()->m_center_menu.Get();
@@ -554,8 +416,9 @@ auto GetMenuMenuEntries() -> std::span<const MiscMenuEntry> {
     return MISC_MENU_ENTRIES;
 }
 
-MainMenu::MainMenu() {
+MainMenu::MainMenu(bool updater_only) {
     CheckForUpdates(false);
+    if (updater_only) return;
 
     this->SetActions(
         std::make_pair(Button::START, Action{[](){
@@ -596,7 +459,7 @@ MainMenu::MainMenu() {
             language_items.push_back("Türkçe"); // Turkish
 
             // build menus info.
-            std::string menus_info = "Launch one of Sphaira's menus:\n"_i18n;
+            std::string menus_info = "Launch one of NinMagicFoil's menus:\n"_i18n;
             for (auto& e : GetMenuMenuEntries()) {
                 if (e.name == App::GetApp()->m_left_menu.Get()) {
                     continue;
@@ -644,7 +507,7 @@ MainMenu::MainMenu() {
 
             options->Add<SidebarEntryCallback>("Theme"_i18n, [](){
                 App::DisplayThemeOptions();
-            }, "Customise the look of Sphaira by changing the theme"_i18n);
+            }, "Customise the look of NinMagicFoil by changing the theme"_i18n);
 
             options->Add<SidebarEntryArray>("Language"_i18n, language_items, [](s64& index_out){
                 App::SetLanguage(index_out);
@@ -670,7 +533,7 @@ MainMenu::MainMenu() {
 
             options->Add<SidebarEntryCallback>("Check for Updates"_i18n, [this](){
                 CheckForUpdates(true);
-            }, true, "Check for Sphaira updates and view the changelog."_i18n);
+            }, true, "Check for NinMagicFoil updates and view the changelog."_i18n);
         }}
     ));
 
@@ -691,127 +554,81 @@ MainMenu::MainMenu() {
 }
 
 MainMenu::~MainMenu() {
-
+    m_stop_source.request_stop();
+    m_update_worker.request_stop();
 }
 
 void MainMenu::CheckForUpdates(bool show_result) {
     const auto generation = ++m_update_generation;
     m_update_state = UpdateState::Pending;
-    if (show_result) {
-        App::Notify("Checking for updates"_i18n);
-    }
-
-    const auto queued = curl::Api().ToFileAsync(
-        curl::Url{GITHUB_URL},
-        curl::Path{CACHE_PATH},
-        curl::Flags{curl::Flag_Cache},
-        curl::StopToken{this->GetToken()},
-        curl::Header{
-            { "Accept", "application/vnd.github+json" },
-            { "X-GitHub-Api-Version", "2022-11-28" },
-        },
-        curl::OnComplete{[this, generation, show_result](auto& result){
-            if (generation != m_update_generation) {
-                return;
-            }
-
-            const bool parsed = result.success && ParseUpdateMetadata(CACHE_PATH);
-            if (!parsed) {
-                m_update_state = UpdateState::Error;
-            }
-            log_write("update status: %u http: %ld\n", static_cast<u8>(m_update_state), result.code);
-
-            if (show_result) {
-                ShowUpdateInfo();
-            } else if (m_update_state == UpdateState::Update) {
-                App::Notify("Update available: "_i18n + m_update_version);
-                App::Notify("Open Menu Options to view the changelog."_i18n);
-            }
-        }}
-    );
-
-    if (!queued) {
-        m_update_state = UpdateState::Error;
-        if (show_result) {
-            ShowUpdateInfo();
-        }
-    }
+    if (show_result) App::Notify("Checking for updates"_i18n);
+    m_update_worker.request_stop();
+    const auto owner_token = GetToken();
+    m_update_worker = std::jthread([this, generation, show_result, owner_token](std::stop_token token) {
+        std::string body;
+        long status{};
+        const bool success = ninmagic::update::FetchReleaseJson(token, body, status);
+        if (token.stop_requested() || owner_token.stop_requested()) return;
+        evman::push(evman::CallbackEventData{
+            .callback = [this, generation, show_result, success, status, body = std::move(body)]() {
+                if (generation != m_update_generation) return;
+                if (!success || !ParseUpdateMetadata(body)) m_update_state = UpdateState::Error;
+                log_write("[NinMagic updater] status=%u http=%ld\n", static_cast<u8>(m_update_state), status);
+                if (show_result) ShowUpdateInfo();
+                else if (m_update_state == UpdateState::Update) App::Notify("Update available: "_i18n + m_update_version);
+            },
+            .stoken = owner_token,
+        }, false);
+    });
 }
 
-auto MainMenu::ParseUpdateMetadata(const fs::FsPath& path) -> bool {
-    auto document = yyjson_read_file(path, YYJSON_READ_NOFLAG, nullptr, nullptr);
-    if (!document) {
-        return false;
-    }
+auto MainMenu::ParseUpdateMetadata(std::string_view json) -> bool {
+    using namespace ninmagic::update;
+    m_update_release = {};
+    const auto document = yyjson_read(json.data(), json.size(), YYJSON_READ_NOFLAG);
+    if (!document) return false;
     ON_SCOPE_EXIT(yyjson_doc_free(document));
-
     const auto root = yyjson_doc_get_root(document);
-    if (!root || !yyjson_is_obj(root)) {
-        return false;
-    }
-
+    if (!root || !yyjson_is_obj(root)) return false;
+    const auto draft = yyjson_obj_get(root, "draft");
+    const auto prerelease = yyjson_obj_get(root, "prerelease");
+    if (!yyjson_is_bool(draft) || yyjson_get_bool(draft) || !yyjson_is_bool(prerelease) || yyjson_get_bool(prerelease)) return false;
     const auto tag_value = yyjson_obj_get(root, "tag_name");
-    const auto version = tag_value ? yyjson_get_str(tag_value) : nullptr;
-    if (!version || !*version) {
-        return false;
-    }
-
+    if (!yyjson_is_str(tag_value)) return false;
+    const std::string tag{yyjson_get_str(tag_value), yyjson_get_len(tag_value)};
+    const auto version = ParseVersion(tag);
+    const auto current = ParseVersion(APP_VERSION, false);
+    if (!version || !current) return false;
+    m_update_version = tag;
     std::string body;
-    if (const auto body_value = yyjson_obj_get(root, "body"); body_value && yyjson_is_str(body_value)) {
-        if (const auto value = yyjson_get_str(body_value)) {
-            body = value;
-        }
-    }
-
-    m_update_version = version;
-    m_update_description = LocalizeReleaseNotes(body, m_update_version);
-    m_update_url.clear();
-
-    if (!App::IsVersionNewer(APP_VERSION, version)) {
+    if (const auto value = yyjson_obj_get(root, "body"); yyjson_is_str(value)) body.assign(yyjson_get_str(value), yyjson_get_len(value));
+    m_update_description = LocalizeReleaseNotes(body, tag);
+    if (*version <= *current) {
         m_update_state = UpdateState::None;
         return true;
     }
-
     const auto assets = yyjson_obj_get(root, "assets");
-    if (!assets || !yyjson_is_arr(assets)) {
-        return false;
-    }
-
-    int best_score{};
-    size_t index{}, count{};
+    if (!yyjson_is_arr(assets)) return false;
+    std::size_t matches{};
+    std::size_t index{}, count{};
     yyjson_val* asset{};
     yyjson_arr_foreach(assets, index, count, asset) {
-        if (!asset || !yyjson_is_obj(asset)) {
-            continue;
-        }
-        const auto name_value = yyjson_obj_get(asset, "name");
-        const auto url_value = yyjson_obj_get(asset, "browser_download_url");
-        const auto name = name_value ? yyjson_get_str(name_value) : nullptr;
-        const auto url = url_value ? yyjson_get_str(url_value) : nullptr;
-        if (!name || !url || !*url) {
-            continue;
-        }
-
-        const auto lower_name = Lower(name);
-        const bool sphaira_asset = lower_name.find("sphaira") != std::string::npos;
-        int score{};
-        if (EndsWithCaseInsensitive(name, ".nro")) {
-            score = sphaira_asset ? 4 : 3;
-        } else if (EndsWithCaseInsensitive(name, ".zip")) {
-            score = sphaira_asset ? 2 : 1;
-        }
-        if (score > best_score) {
-            best_score = score;
-            m_update_url = url;
-        }
+        const auto name = yyjson_obj_get(asset, "name");
+        if (!yyjson_is_str(name) || std::string_view{yyjson_get_str(name), yyjson_get_len(name)} != ninmagic::ReleaseAsset) continue;
+        if (++matches != 1) return false;
+        const auto state = yyjson_obj_get(asset, "state");
+        const auto url = yyjson_obj_get(asset, "browser_download_url");
+        const auto size = yyjson_obj_get(asset, "size");
+        const auto digest = yyjson_obj_get(asset, "digest");
+        if (!yyjson_is_str(state) || std::string_view{yyjson_get_str(state), yyjson_get_len(state)} != "uploaded"
+            || !yyjson_is_str(url) || !yyjson_is_uint(size) || !yyjson_is_str(digest)) return false;
+        const auto sha = ParseDigest({yyjson_get_str(digest), yyjson_get_len(digest)});
+        if (!sha) return false;
+        m_update_release = Release{tag, {yyjson_get_str(url), yyjson_get_len(url)}, *sha, yyjson_get_uint(size)};
+        if (!IsValidRelease(m_update_release)) return false;
     }
-
-    if (m_update_url.empty()) {
-        return false;
-    }
-
+    if (matches != 1) return false;
     m_update_state = UpdateState::Update;
-    log_write("found update version: %s url: %s\n", m_update_version.c_str(), m_update_url.c_str());
     return true;
 }
 
@@ -829,51 +646,53 @@ void MainMenu::ShowUpdateInfo() {
         m_update_version,
         m_update_description.empty() ? "No changelog available."_i18n : m_update_description,
         m_update_state == UpdateState::Update,
-        [this](){ StartUpdateInstall(); }
+        [this, token = GetToken()](){ if (!token.stop_requested()) StartUpdateInstall(); }
     );
 }
 
 void MainMenu::StartUpdateInstall() {
-    if (m_update_state != UpdateState::Update || m_update_url.empty()) {
+    if (m_update_state != UpdateState::Update || !ninmagic::update::IsValidRelease(m_update_release)) return;
+    if (InstallQueue::Get().IsBusy()) {
+        App::Notify("Espera a que termine la cola de instalaciones antes de actualizar NinMagicFoil.");
         return;
     }
-
-    App::Push<ProgressBox>(0, "Downloading "_i18n, "Sphaira " + m_update_version, [this](auto pbox) -> Result {
-        return InstallUpdate(pbox, m_update_url, m_update_version);
-    }, [this](Result rc){
-        App::PushErrorBox(rc, "Failed to install update"_i18n);
-        if (R_SUCCEEDED(rc)) {
-            m_update_state = UpdateState::None;
-            App::Notify("Update complete. Restarting Sphaira."_i18n);
-            App::Push<OptionBox>(
-                "Press OK to restart Sphaira"_i18n, "OK"_i18n, [](auto){
-                    App::ExitRestart();
-                }
-            );
-        }
-    });
+    if (!ninmagic::update::IsInstallPath(App::GetExePath().toString())) {
+        App::Push<OptionBox>("Para actualizar, abre NinMagicFoil desde /switch/NinMagicFoil/NinMagicFoil.nro", "OK"_i18n);
+        return;
+    }
+    const auto token = GetToken();
+    App::Push<ProgressBox>(0, "Downloading "_i18n, std::string{ninmagic::AppName} + " " + m_update_version,
+        [release = m_update_release](auto pbox) -> Result { return ninmagic::update::Install(pbox, release); },
+        [this, token](Result rc) {
+            if (token.stop_requested()) return;
+            App::PushErrorBox(rc, "No se pudo actualizar NinMagicFoil. Si fallo la sustitucion, la copia anterior se conserva en /config/NinMagicFoil/update/NinMagicFoil.previous.nro");
+            if (R_SUCCEEDED(rc)) {
+                m_update_state = UpdateState::None;
+                App::Push<OptionBox>("NinMagicFoil se ha actualizado. Pulsa OK para reiniciar.", "OK"_i18n, [](auto){ App::ExitRestart(); });
+            }
+        });
 }
 
 void MainMenu::Update(Controller* controller, TouchInfo* touch) {
-    m_current_menu->Update(controller, touch);
+    if (m_current_menu) m_current_menu->Update(controller, touch);
 }
 
 void MainMenu::Draw(NVGcontext* vg, Theme* theme) {
-    m_current_menu->Draw(vg, theme);
+    if (m_current_menu) m_current_menu->Draw(vg, theme);
 }
 
 void MainMenu::OnFocusGained() {
     Widget::OnFocusGained();
-    m_current_menu->OnFocusGained();
+    if (m_current_menu) m_current_menu->OnFocusGained();
 }
 
 void MainMenu::OnFocusLost() {
     Widget::OnFocusLost();
-    m_current_menu->OnFocusLost();
+    if (m_current_menu) m_current_menu->OnFocusLost();
 }
 
 void MainMenu::OnLRPress(MenuBase* menu, Button b) {
-    m_current_menu->OnFocusLost();
+    if (m_current_menu) m_current_menu->OnFocusLost();
     if (m_current_menu == m_centre_menu.get()) {
         m_current_menu = menu;
         RemoveAction(b);
@@ -882,7 +701,7 @@ void MainMenu::OnLRPress(MenuBase* menu, Button b) {
     }
 
     AddOnLRPress();
-    m_current_menu->OnFocusGained();
+    if (m_current_menu) m_current_menu->OnFocusGained();
 
     for (auto [button, action] : m_actions) {
         m_current_menu->SetAction(button, action);

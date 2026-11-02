@@ -9,6 +9,7 @@
 #include "ui/menus/main_menu.hpp"
 
 #include "app.hpp"
+#include "ninmagic_tls.hpp"
 #include "log.hpp"
 #include "ui/nvg_util.hpp"
 #include "nro.hpp"
@@ -798,7 +799,7 @@ auto App::GetLogEnable() -> bool {
 }
 
 auto App::GetReplaceHbmenuEnable() -> bool {
-    return g_app->m_replace_hbmenu.Get();
+    return false;
 }
 
 auto App::GetInstallEnable() -> bool {
@@ -923,103 +924,9 @@ void App::SetLogEnable(bool enable) {
     }
 }
 
-void App::SetReplaceHbmenuEnable(bool enable) {
-    if (App::GetReplaceHbmenuEnable() != enable) {
-        g_app->m_replace_hbmenu.Set(enable);
-        if (!enable) {
-            // check we have already replaced hbmenu with sphaira
-            NacpStruct hbmenu_nacp{};
-            if (R_SUCCEEDED(nro_get_nacp("/hbmenu.nro", hbmenu_nacp))) {
-                if (std::strcmp(NacpLanguageEntries(hbmenu_nacp)[0].name, "sphaira")) {
-                    return;
-                }
-            }
-
-            // ask user if they want to restore hbmenu
-            App::Push<ui::OptionBox>(
-                "Restore hbmenu?"_i18n,
-                "Back"_i18n, "Restore"_i18n, 1, [hbmenu_nacp](auto op_index){
-                    if (!op_index || *op_index == 0) {
-                        return;
-                    }
-
-                    NacpStruct actual_hbmenu_nacp;
-                    if (R_FAILED(nro_get_nacp("/switch/hbmenu.nro", actual_hbmenu_nacp))) {
-                        App::Push<ui::OptionBox>(
-                            i18n::get("missing_hbmenu_info",
-                                "Failed to find /switch/hbmenu.nro\n"
-                                "Use the Appstore to re-install hbmenu"
-                            ), "OK"_i18n
-                        );
-                        return;
-                    }
-
-                    // NOTE: do NOT use rename anywhere here as it's possible
-                    // to have a race condition with another app that opens hbmenu as a file
-                    // in between the delete + rename.
-                    // this would require a sys-module to open hbmenu.nro, such as an ftp server.
-                    // a copy means that it opens the file handle, if successfull, then
-                    // the full read/write will succeed.
-                    NacpStruct sphaira_nacp;
-                    fs::FsPath sphaira_path = "/switch/sphaira/sphaira.nro";
-                    Result rc;
-
-                    // first, try and backup sphaira, its not super important if this fails.
-                    rc = nro_get_nacp(sphaira_path, sphaira_nacp);
-                    if (R_FAILED(rc) || std::strcmp(NacpLanguageEntries(sphaira_nacp)[0].name, "sphaira")) {
-                        sphaira_path = "/switch/sphaira.nro";
-                        rc = nro_get_nacp(sphaira_path, sphaira_nacp);
-                    }
-
-                    if (R_SUCCEEDED(rc) && !std::strcmp(NacpLanguageEntries(sphaira_nacp)[0].name, "sphaira")) {
-                        if (IsVersionNewer(sphaira_nacp.display_version, hbmenu_nacp.display_version)) {
-                            if (R_FAILED(rc = g_app->m_fs->copy_entire_file(sphaira_path, "/hbmenu.nro"))) {
-                                log_write("failed to copy entire file: %s 0x%X module: %u desc: %u\n", sphaira_path.s, rc, R_MODULE(rc), R_DESCRIPTION(rc));
-                            } else {
-                                log_write("success with updating hbmenu!\n");
-                            }
-                        }
-                    } else {
-                        // sphaira doesn't yet exist, create a new file.
-                        sphaira_path = "/switch/sphaira/sphaira.nro";
-                        g_app->m_fs->CreateDirectoryRecursively("/switch/sphaira/");
-                        g_app->m_fs->copy_entire_file(sphaira_path, "/hbmenu.nro");
-                    }
-
-                    // this should never fail, if it does, well then the sd card is fucked.
-                    if (R_FAILED(rc = g_app->m_fs->copy_entire_file("/hbmenu.nro", "/switch/hbmenu.nro")))  {
-                        // try and restore sphaira in a last ditch effort.
-                        if (R_FAILED(rc = g_app->m_fs->copy_entire_file("/hbmenu.nro", sphaira_path))) {
-                            App::PushErrorBox(rc,
-                                "Failed to restore hbmenu, please re-download hbmenu"_i18n
-                            );
-                        } else {
-                            App::Push<ui::OptionBox>(
-                                "Failed to restore hbmenu, using sphaira instead"_i18n,
-                                "OK"_i18n
-                            );
-                        }
-                        return;
-                    }
-
-                    // don't need this any more.
-                    g_app->m_fs->DeleteFile("/switch/hbmenu.nro");
-
-                    // if we were hbmenu, exit now (as romfs is gone).
-                    if (IsHbmenu()) {
-                        App::Push<ui::OptionBox>(
-                            "Restored hbmenu, closing sphaira"_i18n,
-                            "OK"_i18n, [](auto) {
-                                App::Exit();
-                            }
-                        );
-                    } else {
-                        App::Notify("Restored hbmenu"_i18n);
-                    }
-                }
-            );
-        }
-    }
+void App::SetReplaceHbmenuEnable(bool) {
+    // NinMagicFoil is a standalone application, never a replacement hbmenu.
+    g_app->m_replace_hbmenu.Set(false);
 }
 
 void App::SetInstallSysmmcEnable(bool enable) {
@@ -1079,7 +986,7 @@ void App::SetLanguage(long index) {
         on_i18n_change();
 
         App::Push<ui::OptionBox>(
-            "Restart Sphaira?"_i18n,
+            "Restart NinMagicFoil?"_i18n,
             "Back"_i18n, "Restart"_i18n, 1, [](auto op_index){
                 if (op_index && *op_index) {
                     App::ExitRestart();
@@ -1116,11 +1023,11 @@ auto App::Install(ui::ProgressBox* pbox, OwoConfig& config) -> Result {
     config.icon = GetNroIcon(config.icon);
 
     if (config.logo.empty()) {
-        g_app->m_fs->read_entire_file("/config/sphaira/logo/NintendoLogo.png", config.logo);
+        g_app->m_fs->read_entire_file("/config/NinMagicFoil/logo/NintendoLogo.png", config.logo);
     }
 
     if (config.gif.empty()) {
-        g_app->m_fs->read_entire_file("/config/sphaira/logo/StartupMovie.gif", config.gif);
+        g_app->m_fs->read_entire_file("/config/NinMagicFoil/logo/StartupMovie.gif", config.gif);
     }
 
     return install_forwarder(pbox, config, GetInstallSdEnable() ? NcmStorageId_SdCard : NcmStorageId_BuiltInUser);
@@ -1593,7 +1500,7 @@ void App::ScanThemeEntries() {
     }
 
     // then load custom entries
-    ScanThemes("/config/sphaira/themes/");
+    ScanThemes("/config/NinMagicFoil/themes/");
 }
 
 void App::LoadAndPlayThemeMusic() {
@@ -1605,7 +1512,7 @@ void App::LoadAndPlayThemeMusic() {
 }
 
 Result App::SetDefaultBackgroundMusic(fs::Fs* fs, const fs::FsPath& path) {
-    constexpr const char* base_path = "/config/sphaira/themes/default_music.";
+    constexpr const char* base_path = "/config/NinMagicFoil/themes/default_music.";
 
     const auto ext = std::strrchr(path, '.');
     R_UNLESS(ext, 0x1);
@@ -1789,6 +1696,12 @@ App::App(const char* argv0) {
         log_write("hello world v%s\n", APP_DISPLAY_VERSION);
     }
 
+    // Prepare the pinned CA cache before starting workers. ROMFS is temporary
+    // and must not be mounted from competing download threads.
+    if (const auto rc = ninmagic::tls::PrepareTrustStore(); R_FAILED(rc)) {
+        log_write("[TLS] trust store initialization failed: 0x%X\n", rc);
+    }
+
     // anything that can be async loaded should be placed in here in order
     // to halve load times.
     // rules:
@@ -1801,12 +1714,12 @@ App::App(const char* argv0) {
 
         {
             SCOPED_TIMESTAMP("config directory init");
-            m_fs->CreateDirectoryRecursively("/config/sphaira");
-            m_fs->CreateDirectory("/config/sphaira/assoc");
-            m_fs->CreateDirectory("/config/sphaira/themes");
-            m_fs->CreateDirectory("/config/sphaira/github");
-            m_fs->CreateDirectory("/config/sphaira/i18n");
-            m_fs->CreateDirectory("/config/sphaira/mount");
+            m_fs->CreateDirectoryRecursively("/config/NinMagicFoil");
+            m_fs->CreateDirectory("/config/NinMagicFoil/assoc");
+            m_fs->CreateDirectory("/config/NinMagicFoil/themes");
+            m_fs->CreateDirectory("/config/NinMagicFoil/github");
+            m_fs->CreateDirectory("/config/NinMagicFoil/i18n");
+            m_fs->CreateDirectory("/config/NinMagicFoil/mount");
 
             if (!ini_haskey("steamgriddb", "api_key", CONFIG_PATH)) {
                 ini_puts("steamgriddb", "api_key", "", CONFIG_PATH);
@@ -1816,8 +1729,8 @@ App::App(const char* argv0) {
         {
             // delete old cached folders/files on startup.
             SCOPED_TIMESTAMP("old cache delete");
-            m_fs->DeleteDirectoryRecursively("/switch/sphaira/cache/themezer"); // themezer icon/json cache.
-            m_fs->DeleteFile("/switch/sphaira/cache/cache.json"); // old etag cache.
+            m_fs->DeleteDirectoryRecursively("/switch/NinMagicFoil/cache/themezer"); // themezer icon/json cache.
+            m_fs->DeleteFile("/switch/NinMagicFoil/cache/cache.json"); // old etag cache.
         }
 
         if (log_is_init()) {
@@ -2012,7 +1925,7 @@ App::App(const char* argv0) {
     }
 
     if (App::GetLogEnable()) {
-        App::Notify("Warning! Logs are enabled, Sphaira will run slowly!"_i18n);
+        App::Notify("Warning! Logs are enabled, NinMagicFoil will run slowly!"_i18n);
     }
 
 #ifdef USE_NVJPG
@@ -2171,7 +2084,7 @@ void App::DisplayThemeOptions(bool left_side) {
 
     options->Add<ui::SidebarEntryArray>("Select Theme"_i18n, theme_items, [](s64& index_out){
         App::SetTheme(index_out);
-    }, App::GetThemeIndex(), "Customise the look of Sphaira by changing the theme"_i18n);
+    }, App::GetThemeIndex(), "Customise the look of NinMagicFoil by changing the theme"_i18n);
 
     options->Add<ui::SidebarEntryBool>("Music"_i18n, App::GetThemeMusicEnable(), [](bool& enable){
         App::SetThemeMusicEnable(enable);
@@ -2268,33 +2181,16 @@ void App::DisplayAdvancedOptions(bool left_side) {
     text_scroll_speed_items.push_back("Normal"_i18n);
     text_scroll_speed_items.push_back("Fast"_i18n);
 
-    std::vector<std::string> menu_names;
-    ui::SidebarEntryArray::Items menu_items;
-    for (auto& e : ui::menu::main::GetMenuMenuEntries()) {
-        if (!e.IsShortcut()) {
-            continue;
-        }
-
-        menu_names.emplace_back(e.name);
-        menu_items.push_back(i18n::get(e.name));
-    }
-
     options->Add<ui::SidebarEntryBool>("Logging"_i18n, App::GetLogEnable(), [](bool& enable){
         App::SetLogEnable(enable);
-    }, "Logs to /config/sphaira/log.txt"_i18n);
-
-    options->Add<ui::SidebarEntryBool>("Replace hbmenu on exit"_i18n, App::GetReplaceHbmenuEnable(), [](bool& enable){
-        App::SetReplaceHbmenuEnable(enable);
-    },  i18n::get("hbmenu_replace_info",
-            "When enabled, it replaces /hbmenu.nro with Sphaira, creating a backup of hbmenu to /switch/hbmenu.nro\n\n"
-            "Disabling will give you the option to restore hbmenu."));
+    }, "Logs to /config/NinMagicFoil/log.txt"_i18n);
 
     options->Add<ui::SidebarEntryCallback>("Add / modify mounts"_i18n, [](){
         devoptab::DisplayDevoptabSideBar();
     },  i18n::get("mount_options_info",
             "Create, modify, delete network mounts (HTTP, FTP, SFTP, SMB, NFS).\n"
             "Mount options only require a URL and Name be set, with other fields being optional, such as port, user, pass etc.\n\n"
-            "Any changes made will require restarting Sphaira to take effect."));
+            "Any changes made will require restarting NinMagicFoil to take effect."));
 
     options->Add<ui::SidebarEntryBool>("Boost CPU during transfer"_i18n, App::GetApp()->m_progress_boost_mode,
         i18n::get("transfer_boost_info",
@@ -2310,64 +2206,6 @@ void App::DisplayAdvancedOptions(bool left_side) {
     options->Add<ui::SidebarEntryArray>("Text scroll speed"_i18n, text_scroll_speed_items, [](s64& index_out){
         App::SetTextScrollSpeed(index_out);
     }, App::GetTextScrollSpeed(), "Change how fast the scrolling text updates"_i18n);
-
-    options->Add<ui::SidebarEntryArray>("Set center menu"_i18n, menu_items, [menu_names](s64& index_out){
-        const auto e = menu_names[index_out];
-        if (g_app->m_center_menu.Get() != e) {
-            // swap menus around.
-            if (g_app->m_left_menu.Get() == e) {
-                g_app->m_left_menu.Set(g_app->m_left_menu.Get());
-            } else if (g_app->m_right_menu.Get() == e) {
-                g_app->m_right_menu.Set(g_app->m_left_menu.Get());
-            }
-            g_app->m_center_menu.Set(e);
-
-            App::Push<ui::OptionBox>(
-                "Press OK to restart Sphaira"_i18n, "OK"_i18n, [](auto){
-                    App::ExitRestart();
-                }
-            );
-        }
-    }, i18n::get(g_app->m_center_menu.Get()), "Set the menu that appears on the center tab."_i18n);
-
-
-    options->Add<ui::SidebarEntryArray>("Set left-side menu"_i18n, menu_items, [menu_names](s64& index_out){
-        const auto e = menu_names[index_out];
-        if (g_app->m_left_menu.Get() != e) {
-            // swap menus around.
-            if (g_app->m_center_menu.Get() == e) {
-                g_app->m_center_menu.Set(g_app->m_left_menu.Get());
-            } else if (g_app->m_right_menu.Get() == e) {
-                g_app->m_right_menu.Set(g_app->m_left_menu.Get());
-            }
-            g_app->m_left_menu.Set(e);
-
-            App::Push<ui::OptionBox>(
-                "Press OK to restart Sphaira"_i18n, "OK"_i18n, [](auto){
-                    App::ExitRestart();
-                }
-            );
-        }
-    }, i18n::get(g_app->m_left_menu.Get()), "Set the menu that appears on the left tab."_i18n);
-
-    options->Add<ui::SidebarEntryArray>("Set right-side menu"_i18n, menu_items, [menu_names](s64& index_out){
-        const auto e = menu_names[index_out];
-        if (g_app->m_right_menu.Get() != e) {
-            // swap menus around.
-            if (g_app->m_center_menu.Get() == e) {
-                g_app->m_center_menu.Set(g_app->m_right_menu.Get());
-            } else if (g_app->m_left_menu.Get() == e) {
-                g_app->m_left_menu.Set(g_app->m_right_menu.Get());
-            }
-            g_app->m_right_menu.Set(e);
-
-            App::Push<ui::OptionBox>(
-                "Press OK to restart Sphaira"_i18n, "OK"_i18n, [](auto){
-                    App::ExitRestart();
-                }
-            );
-        }
-    }, i18n::get(g_app->m_right_menu.Get()), "Set the menu that appears on the right tab."_i18n);
 
     options->Add<ui::SidebarEntryCallback>("Install options"_i18n, [left_side](){
         App::DisplayInstallOptions(left_side);
@@ -2564,7 +2402,7 @@ void App::DisplayDumpOptions(bool left_side) {
         i18n::get("block_compress_info",
             "Enables block compression, which compresses the NCA into blocks (at the cost of compression ratio) "
             "which allows for random access, allowing the NCZ to be mounted as a file system.\n\n"
-            "NOTE: Sphaira does not yet support mounting NCZ as a file system, but it will be added evntually."
+            "NOTE: NinMagicFoil does not yet support mounting NCZ as a file system, but it will be added evntually."
         )
     );
 
@@ -2709,7 +2547,7 @@ void App::DisplayFtpOptions(bool left_side) {
         "Show mounts"_i18n, App::GetApp()->m_ftp_show_mounts,
         i18n::get("mounts_ftp_info",
             "Shows the mounts folder.\n\n"
-            "This folder is contains all of the mounts added to Sphaira, allowing you to acces them over FTP!\n"
+            "This folder is contains all of the mounts added to NinMagicFoil, allowing you to acces them over FTP!\n"
             "For example, you can access your SMB, WebDav or other FTP mounts over FTP."
         )
     );
@@ -2804,7 +2642,7 @@ void App::DisplayMtpOptions(bool left_side) {
         "Show mounts"_i18n, App::GetApp()->m_mtp_show_mounts,
         i18n::get("mounts_mtp_info",
             "Shows the mounts folder.\n\n"
-            "This folder is contains all of the mounts added to Sphaira, allowing you to acces them over MTP!\n"
+            "This folder is contains all of the mounts added to NinMagicFoil, allowing you to acces them over MTP!\n"
             "For example, you can access your SMB, WebDav and FTP mounts over MTP."
         )
     );
@@ -3010,60 +2848,8 @@ App::~App() {
     #endif
         }
 
-        // backup hbmenu if it is not sphaira
-        {
-            SCOPED_TIMESTAMP("nro copy main");
-            if (App::GetReplaceHbmenuEnable() && !IsHbmenu()) {
-                NacpStruct hbmenu_nacp;
-                Result rc;
+        // NinMagicFoil updates only its canonical NRO through its verified updater.
 
-                // todo: don't read whole nacp, only the name.
-                // todo: keep file open and use that as part of the file copy.
-                if (R_SUCCEEDED(rc = nro_get_nacp("/hbmenu.nro", hbmenu_nacp)) && std::strcmp(NacpLanguageEntries(hbmenu_nacp)[0].name, "sphaira")) {
-                    log_write("backing up hbmenu.nro\n");
-                    if (R_FAILED(rc = m_fs->copy_entire_file("/switch/hbmenu.nro", "/hbmenu.nro"))) {
-                        log_write("failed to backup  hbmenu.nro\n");
-                    }
-                } else {
-                    log_write("not backing up\n");
-                }
-
-                if (R_FAILED(rc = m_fs->copy_entire_file("/hbmenu.nro", GetExePath()))) {
-                    log_write("failed to copy entire file: %s 0x%X module: %u desc: %u\n", GetExePath().s, rc, R_MODULE(rc), R_DESCRIPTION(rc));
-                } else {
-                    log_write("success with copying over root file!\n");
-                }
-            } else if (IsHbmenu()) {
-                // check we have a version that's newer than current.
-                NacpStruct hbmenu_nacp;
-                Result rc;
-
-                // ensure that are still sphaira
-                if (R_SUCCEEDED(rc = nro_get_nacp("/hbmenu.nro", hbmenu_nacp)) && !std::strcmp(NacpLanguageEntries(hbmenu_nacp)[0].name, "sphaira")) {
-                    NacpStruct sphaira_nacp;
-                    fs::FsPath sphaira_path = "/switch/sphaira/sphaira.nro";
-
-                    rc = nro_get_nacp(sphaira_path, sphaira_nacp);
-                    if (R_FAILED(rc) || std::strcmp(NacpLanguageEntries(sphaira_nacp)[0].name, "sphaira")) {
-                        sphaira_path = "/switch/sphaira.nro";
-                        rc = nro_get_nacp(sphaira_path, sphaira_nacp);
-                    }
-
-                    // found sphaira, now lets get compare version
-                    if (R_SUCCEEDED(rc) && !std::strcmp(NacpLanguageEntries(sphaira_nacp)[0].name, "sphaira")) {
-                        if (IsVersionNewer(hbmenu_nacp.display_version, sphaira_nacp.display_version)) {
-                            if (R_FAILED(rc = m_fs->copy_entire_file(GetExePath(), sphaira_path))) {
-                                log_write("failed to copy entire file: %s 0x%X module: %u desc: %u\n", sphaira_path.s, rc, R_MODULE(rc), R_DESCRIPTION(rc));
-                            } else {
-                                log_write("success with updating hbmenu!\n");
-                            }
-                        }
-                    }
-                } else {
-                    log_write("no longer hbmenu!\n");
-                }
-            }
-        }
     }
 
     if (App::GetLogEnable()) {

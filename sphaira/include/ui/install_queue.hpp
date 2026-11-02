@@ -50,6 +50,9 @@ public:
     // bumped every time a job finishes, for pages that show what is installed.
     auto GetFinishedCounter() const -> u64 { return m_finished_counter; }
 
+    struct Snapshot { std::string name; State state; Result rc; u64 id; };
+    auto GetSnapshot() const -> std::vector<Snapshot>;
+
     // the queue screen.
     void ShowMenu();
 

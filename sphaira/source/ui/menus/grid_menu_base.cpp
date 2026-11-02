@@ -71,6 +71,16 @@ void Menu::OnLayoutChange(std::unique_ptr<List>& list, int layout) {
     m_scroll_author.Reset();
     m_scroll_version.Reset();
 
+    if (IsEmbedded()) {
+        if (layout == LayoutType_GridDetail) {
+            list = std::make_unique<List>(2, 6, GetPos(), Vec4{GetX()+10, GetY()+24, (GetW()-30)/2, 155}, Vec2{10,10});
+        } else {
+            const float side = (GetW()-40)/6;
+            list = std::make_unique<List>(6, 18, GetPos(), Vec4{GetX()+5, GetY()+30, side, side}, Vec2{6,18});
+        }
+        return;
+    }
+
     switch (layout) {
         case LayoutType_List: {
             const Vec2 pad{14, 14};

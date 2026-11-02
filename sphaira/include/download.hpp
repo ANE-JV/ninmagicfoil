@@ -11,8 +11,8 @@
 
 namespace sphaira::curl {
 
-// identifies sphaira in curl requests
-constexpr auto USER_AGENT = "Sphaira/" APP_VERSION;
+// identifies NinMagicFoil in curl requests
+constexpr auto USER_AGENT = "NinMagicFoil/" APP_VERSION;
 
 enum {
     Flag_None = 0,
@@ -29,6 +29,13 @@ enum {
     // server that explains itself can be quoted back. note the transfer then
     // counts as a success: the caller has to check result.code itself.
     Flag_KeepErrorBody = 1 << 2,
+
+    // SD downloads that may exceed FAT32's single-file limit. Creates a native
+    // concatenation file before streaming; callers still verify final size.
+    Flag_BigFile = 1 << 3,
+
+    // Older Ownfoil identifies its directory client by the absence of a UA.
+    Flag_LegacyOwnfoil = 1 << 4,
 };
 
 enum class Priority {

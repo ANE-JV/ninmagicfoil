@@ -1,0 +1,8 @@
+{
+  "libnx_repository": "https://github.com/switchbrew/libnx.git",
+  "libnx_commit": "b156b4774fb2df7b93402169509266da7547fc4c",
+  "ci_image": "devkitpro/devkita64@sha256:1fc388c3a0d34bd2045a6dadcb1020e069d5f876a187fd705de14b4440c00282",
+  "configuration": "Release",
+  "lto": false,
+  "note": "Application dependencies are pinned in sphaira/CMakeLists.txt. Local builds record their installed SDK versions; byte identity between local Windows and Linux CI is not guaranteed."
+}

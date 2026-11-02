@@ -1,4 +1,5 @@
 #include "download.hpp"
+#include "ninmagic_tls.hpp"
 #include "log.hpp"
 #include "defines.hpp"
 #include "evman.hpp"
@@ -14,6 +15,9 @@
 #include <mutex>
 #include <algorithm>
 #include <ranges>
+#include <limits>
+#include <optional>
+#include <cctype>
 #include <curl/curl.h>
 #include <yyjson.h>
 
@@ -252,7 +256,7 @@ private:
         }
     }
 
-    static constexpr inline fs::FsPath JSON_PATH{"/switch/sphaira/cache/etag_v2.json"};
+    static constexpr inline fs::FsPath JSON_PATH{"/switch/NinMagicFoil/cache/etag_v2.json"};
     static constexpr inline const char* ETAG_STR{"etag"};
     static constexpr inline const char* LAST_MODIFIED_STR{"last-modified"};
 
@@ -382,7 +386,7 @@ void GetDownloadTempPath(fs::FsPath& buf) {
     count++;
     mutexUnlock(&mutex);
 
-    std::snprintf(buf, sizeof(buf), "/switch/sphaira/cache/download_temp%lu", count_copy);
+    std::snprintf(buf, sizeof(buf), "/switch/NinMagicFoil/cache/download_temp%lu", count_copy);
 }
 
 auto ProgressCallbackFunc(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) -> size_t {
@@ -544,24 +548,63 @@ auto WriteFileCallback(void *contents, size_t size, size_t num_files, void *user
     return realsize;
 }
 
-auto header_callback(char* b, size_t size, size_t nitems, void* userdata) -> size_t {
-    auto header = static_cast<Header*>(userdata);
-    const auto numbytes = size * nitems;
+// A request with authentication or custom headers may follow redirects only
+// within its original origin. This also covers older curl releases whose
+// cross-host credential filtering did not account for every scheme/port change.
+auto HttpOrigin(const std::string& url, const std::string& relative = {}) -> std::optional<std::string> {
+    auto parsed = curl_url();
+    if (!parsed) return std::nullopt;
+    ON_SCOPE_EXIT(curl_url_cleanup(parsed));
+    if (curl_url_set(parsed, CURLUPART_URL, url.c_str(), CURLU_DEFAULT_SCHEME) != CURLUE_OK) return std::nullopt;
+    if (!relative.empty() && curl_url_set(parsed, CURLUPART_URL, relative.c_str(), 0) != CURLUE_OK) return std::nullopt;
+    char* scheme{};
+    char* host{};
+    char* port{};
+    ON_SCOPE_EXIT({ curl_free(scheme); curl_free(host); curl_free(port); });
+    if (curl_url_get(parsed, CURLUPART_SCHEME, &scheme, 0) != CURLUE_OK
+        || curl_url_get(parsed, CURLUPART_HOST, &host, 0) != CURLUE_OK
+        || curl_url_get(parsed, CURLUPART_PORT, &port, CURLU_DEFAULT_PORT) != CURLUE_OK) return std::nullopt;
+    if (strcasecmp(scheme, "http") && strcasecmp(scheme, "https")) return std::nullopt;
+    std::string origin = std::string{scheme} + "://" + host + ":" + port;
+    std::ranges::transform(origin, origin.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+    return origin;
+}
 
-    if (b && numbytes) {
-        const auto dilem = (const char*)memchr(b, ':', numbytes);
-        if (dilem) {
-            const int key_len = dilem - b;
-            const int value_len = numbytes - key_len - 4; // "\r\n"
-            if (key_len > 0 && value_len > 0) {
-                const std::string key(b, key_len);
-                const std::string value(dilem + 2, value_len);
-                header->m_map.insert_or_assign(key, value);
-            }
+struct HeaderContext {
+    Header* header;
+    std::string url;
+    bool restrict_redirect;
+};
+
+auto HasPrivateRequestData(const Api& request) -> bool {
+    return !request.GetUserPass().m_user.empty() || !request.GetUserPass().m_pass.empty()
+        || !request.GetBearer().empty() || !request.GetFields().empty()
+        || !request.GetHeader().m_map.empty() || request.GetUrl().find('@') != std::string::npos;
+}
+
+auto header_callback(char* data, size_t size, size_t count, void* userdata) -> size_t {
+    if (size && count > std::numeric_limits<size_t>::max() / size) return 0;
+    const auto bytes = size * count;
+    auto& context = *static_cast<HeaderContext*>(userdata);
+    const std::string_view line{data, bytes};
+    if (line.starts_with("HTTP/")) context.header->m_map.clear();
+    const auto colon = line.find(':');
+    if (colon == std::string_view::npos || !colon) return bytes;
+    const std::string key{line.substr(0, colon)};
+    auto text = line.substr(colon + 1);
+    while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) text.remove_prefix(1);
+    while (!text.empty() && (text.back() == '\r' || text.back() == '\n' || text.back() == ' ' || text.back() == '\t')) text.remove_suffix(1);
+    const std::string value{text};
+    if (context.restrict_redirect && !strcasecmp(key.c_str(), "Location")) {
+        const auto before = HttpOrigin(context.url);
+        const auto after = HttpOrigin(context.url, value);
+        if (!before || !after || *before != *after) {
+            log_write("[CURL] refused cross-origin redirect for private request\n");
+            return 0;
         }
     }
-
-    return numbytes;
+    context.header->m_map.insert_or_assign(key, value);
+    return bytes;
 }
 
 auto EscapeString(CURL* curl, const std::string& str) -> std::string {
@@ -598,17 +641,25 @@ auto EncodeUrl(const std::string& url) -> std::string {
     clu_code = curl_url_get(clu, CURLUPART_URL, &encoded_url, 0);
     R_UNLESS(clu_code == CURLUE_OK, url);
 
-    log_write("[CURL] encoded url: %s [vs]: %s\n", encoded_url, url.c_str());
     const std::string out = encoded_url;
     curl_free(encoded_url);
     return out;
 }
 
-void SetCommonCurlOptions(CURL* curl, const Api& e) {
-    CURL_EASY_SETOPT_LOG(curl, CURLOPT_USERAGENT, USER_AGENT);
+auto SetCommonCurlOptions(CURL* curl, const Api& e) -> bool {
+    CURL_EASY_SETOPT_LOG(curl, CURLOPT_USERAGENT, (e.GetFlags() & Flag_LegacyOwnfoil) ? nullptr : USER_AGENT);
     CURL_EASY_SETOPT_LOG(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    CURL_EASY_SETOPT_LOG(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-    CURL_EASY_SETOPT_LOG(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    // HTTPS certificate errors are never retried with verification disabled.
+    const auto set = [curl](CURLoption option, auto value) { return curl_easy_setopt(curl, option, value) == CURLE_OK; };
+    const bool https = !strncasecmp(e.GetUrl().c_str(), "https://", 8);
+    if (!ninmagic::tls::ConfigureCurlTrust(curl)
+        || !set(CURLOPT_MAXREDIRS, 5L) || !set(CURLOPT_UNRESTRICTED_AUTH, 0L)
+#if LIBCURL_VERSION_NUM >= 0x075500
+        || !set(CURLOPT_REDIR_PROTOCOLS_STR, https ? "https" : "http,https")
+#else
+        || !set(CURLOPT_REDIR_PROTOCOLS, static_cast<long>(https ? CURLPROTO_HTTPS : CURLPROTO_HTTP | CURLPROTO_HTTPS))
+#endif
+        ) return false;
     CURL_EASY_SETOPT_LOG(curl, CURLOPT_FAILONERROR, (e.GetFlags() & Flag_KeepErrorBody) ? 0L : 1L);
     CURL_EASY_SETOPT_LOG(curl, CURLOPT_NOPROGRESS, 0L);
     CURL_EASY_SETOPT_LOG(curl, CURLOPT_SHARE, g_curl_share);
@@ -616,7 +667,7 @@ void SetCommonCurlOptions(CURL* curl, const Api& e) {
     CURL_EASY_SETOPT_LOG(curl, CURLOPT_UPLOAD_BUFFERSIZE, 1024*512);
 
     // enable all forms of compression supported by libcurl.
-    CURL_EASY_SETOPT_LOG(curl, CURLOPT_ACCEPT_ENCODING, "");
+    CURL_EASY_SETOPT_LOG(curl, CURLOPT_ACCEPT_ENCODING, (e.GetFlags() & Flag_LegacyOwnfoil) ? "identity" : "");
 
     // for smb / ftp, try and use ssl if possible.
     CURL_EASY_SETOPT_LOG(curl, CURLOPT_USE_SSL, (long)CURLUSESSL_TRY);
@@ -625,7 +676,7 @@ void SetCommonCurlOptions(CURL* curl, const Api& e) {
     CURL_EASY_SETOPT_LOG(curl, CURLOPT_HTTPAUTH, (long)CURLAUTH_ANY);
 
     // enable TE is server supports it.
-    CURL_EASY_SETOPT_LOG(curl, CURLOPT_TRANSFER_ENCODING, 1L);
+    CURL_EASY_SETOPT_LOG(curl, CURLOPT_TRANSFER_ENCODING, (e.GetFlags() & Flag_LegacyOwnfoil) ? 0L : 1L);
 
     // set flags.
     if (e.GetFlags() & Flag_NoBody) {
@@ -677,7 +728,7 @@ void SetCommonCurlOptions(CURL* curl, const Api& e) {
     // cancels the request.
     CURL_EASY_SETOPT_LOG(curl, CURLOPT_XFERINFODATA, &e);
     CURL_EASY_SETOPT_LOG(curl, CURLOPT_XFERINFOFUNCTION, ProgressCallbackFunc);
-
+    return true;
 }
 auto DownloadInternal(CURL* curl, const Api& e) -> ApiResult {
     App::SetAutoSleepDisabled(true);
@@ -697,12 +748,20 @@ auto DownloadInternal(CURL* curl, const Api& e) -> ApiResult {
     Header header_in = e.GetHeader();
     Header header_out;
     fs::FsNativeSd fs;
+    ON_SCOPE_EXIT({
+        chunk.f.Close();
+        if (!tmp_buf.empty()) fs.DeleteFile(tmp_buf);
+    });
 
     if (has_file) {
         GetDownloadTempPath(tmp_buf);
         fs.CreateDirectoryRecursivelyWithPath(tmp_buf);
 
-        if (auto rc = fs.CreateFile(tmp_buf, 0, 0); R_FAILED(rc) && rc != FsError_PathAlreadyExists) {
+        // Remove a stale temporary from an interrupted previous launch so its
+        // original regular/concatenated file type cannot override this request.
+        if (fs.FileExists(tmp_buf) && R_FAILED(fs.DeleteFile(tmp_buf))) return {};
+        const auto create_flags = (e.GetFlags() & Flag_BigFile) ? FsCreateOption_BigFile : 0;
+        if (auto rc = fs.CreateFile(tmp_buf, 0, create_flags); R_FAILED(rc)) {
             log_write("failed to create file: %s\n", tmp_buf.s);
             return {};
         }
@@ -711,6 +770,8 @@ auto DownloadInternal(CURL* curl, const Api& e) -> ApiResult {
             log_write("failed to open file: %s\n", tmp_buf.s);
             return {};
         }
+
+        if (R_FAILED(chunk.f.SetSize(0))) return {};
 
         // only add etag if the dst file still exists.
         if ((e.GetFlags() & Flag_Cache) && fs::FileExists(&fs.m_fs, e.GetPath())) {
@@ -722,15 +783,15 @@ auto DownloadInternal(CURL* curl, const Api& e) -> ApiResult {
     chunk.data.reserve(CHUNK_SIZE);
 
     curl_easy_reset(curl);
-    SetCommonCurlOptions(curl, e);
+    if (!SetCommonCurlOptions(curl, e)) return {};
 
     CURL_EASY_SETOPT_LOG(curl, CURLOPT_URL, encoded_url.c_str());
     CURL_EASY_SETOPT_LOG(curl, CURLOPT_HEADERFUNCTION, header_callback);
-    CURL_EASY_SETOPT_LOG(curl, CURLOPT_HEADERDATA, &header_out);
+    HeaderContext header_context{&header_out, encoded_url, HasPrivateRequestData(e)};
+    CURL_EASY_SETOPT_LOG(curl, CURLOPT_HEADERDATA, &header_context);
 
     if (has_post) {
         CURL_EASY_SETOPT_LOG(curl, CURLOPT_POSTFIELDS, e.GetFields().c_str());
-        log_write("setting post field: %s\n", e.GetFields().c_str());
     }
 
     struct curl_slist* list = NULL;
@@ -747,7 +808,6 @@ auto DownloadInternal(CURL* curl, const Api& e) -> ApiResult {
         // try to append header chunk.
         auto temp = curl_slist_append(list, header_str.c_str());
         if (temp) {
-            log_write("adding header: %s\n", header_str.c_str());
             list = temp;
         } else {
             log_write("failed to append header\n");
@@ -770,18 +830,18 @@ auto DownloadInternal(CURL* curl, const Api& e) -> ApiResult {
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
     if (has_file) {
-        ON_SCOPE_EXIT( fs.DeleteFile(tmp_buf) );
-        if (res == CURLE_OK && chunk.offset) {
-            chunk.f.Write(chunk.file_offset, chunk.data.data(), chunk.offset, FsWriteOption_None);
+        if (success && chunk.offset) {
+            success = R_SUCCEEDED(chunk.f.Write(chunk.file_offset, chunk.data.data(), chunk.offset, FsWriteOption_None));
         }
-
+        if (success) success = R_SUCCEEDED(fsFileFlush(&chunk.f.m_native));
         chunk.f.Close();
+        if (success) success = R_SUCCEEDED(fs.Commit());
 
-        if (res == CURLE_OK) {
+        if (success) {
             if (http_code == 304) {
-                log_write("cached download: %s\n", e.GetUrl().c_str());
+                log_write("[CURL] cached download\n");
             } else {
-                log_write("un-cached download: %s code: %lu\n", e.GetUrl().c_str(), http_code);
+                log_write("[CURL] uncached download code: %ld\n", http_code);
                 if (e.GetFlags() & Flag_Cache) {
                     g_cache.set(e.GetPath(), header_out);
                 }
@@ -795,10 +855,11 @@ auto DownloadInternal(CURL* curl, const Api& e) -> ApiResult {
                 log_write("\n\n");
                 #endif
 
-                fs.DeleteFile(e.GetPath());
-                fs.CreateDirectoryRecursivelyWithPath(e.GetPath());
-                if (R_FAILED(fs.RenameFile(tmp_buf, e.GetPath()))) {
+                if (R_FAILED(fs.CreateDirectoryRecursivelyWithPath(e.GetPath()))) {
                     success = false;
+                } else {
+                    if (fs.FileExists(e.GetPath()) && R_FAILED(fs.DeleteFile(e.GetPath()))) success = false;
+                    if (success) success = R_SUCCEEDED(fs.RenameFile(tmp_buf, e.GetPath()));
                 }
             }
         }
@@ -810,7 +871,7 @@ auto DownloadInternal(CURL* curl, const Api& e) -> ApiResult {
         }
     }
 
-    log_write("Downloaded %s code: %ld %s\n", e.GetUrl().c_str(), http_code, curl_easy_strerror(res));
+    log_write("[CURL] download code: %ld %s\n", http_code, curl_easy_strerror(res));
     return {success, http_code, header_out, chunk.data, e.GetPath()};
 }
 
@@ -863,11 +924,12 @@ auto UploadInternal(CURL* curl, const Api& e) -> ApiResult {
     chunk_out.data.reserve(CHUNK_SIZE);
 
     curl_easy_reset(curl);
-    SetCommonCurlOptions(curl, e);
+    if (!SetCommonCurlOptions(curl, e)) return {};
 
     CURL_EASY_SETOPT_LOG(curl, CURLOPT_URL, encoded_url.c_str());
     CURL_EASY_SETOPT_LOG(curl, CURLOPT_HEADERFUNCTION, header_callback);
-    CURL_EASY_SETOPT_LOG(curl, CURLOPT_HEADERDATA, &header_out);
+    HeaderContext header_context{&header_out, encoded_url, HasPrivateRequestData(e)};
+    CURL_EASY_SETOPT_LOG(curl, CURLOPT_HEADERDATA, &header_context);
 
     CURL_EASY_SETOPT_LOG(curl, CURLOPT_UPLOAD, 1L);
     CURL_EASY_SETOPT_LOG(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)chunk.size);
@@ -889,7 +951,6 @@ auto UploadInternal(CURL* curl, const Api& e) -> ApiResult {
         // try to append header chunk.
         auto temp = curl_slist_append(list, header_str.c_str());
         if (temp) {
-            log_write("adding header: %s\n", header_str.c_str());
             list = temp;
         } else {
             log_write("failed to append header\n");
@@ -935,7 +996,7 @@ auto UploadInternal(CURL* curl, const Api& e) -> ApiResult {
         chunk.f.Close();
     }
 
-    log_write("Uploaded %s code: %ld %s\n", url.c_str(), http_code, curl_easy_strerror(res));
+    log_write("[CURL] upload code: %ld %s\n", http_code, curl_easy_strerror(res));
     return {success, http_code, header_out, chunk_out.data};
 }
 

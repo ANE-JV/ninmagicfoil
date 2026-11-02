@@ -340,8 +340,8 @@ void ShowForwarderEditor(const FileAssocEntry& assoc, const RomDatabaseIndexs& d
 
         // if this is a rom, load intro logo.
         if (has_rom_logo) {
-            fs::FsNativeSd().read_entire_file("/config/sphaira/logo/rom/NintendoLogo.png", config.logo);
-            fs::FsNativeSd().read_entire_file("/config/sphaira/logo/rom/StartupMovie.gif", config.gif);
+            fs::FsNativeSd().read_entire_file("/config/NinMagicFoil/logo/rom/NintendoLogo.png", config.logo);
+            fs::FsNativeSd().read_entire_file("/config/NinMagicFoil/logo/rom/StartupMovie.gif", config.gif);
         }
 
         // try and install.
@@ -545,7 +545,7 @@ void FsView::Draw(NVGcontext* vg, Theme* theme) {
         }
 
         if (e.IsDir()) {
-            DrawElement(x + text_xoffset, y + 5, 50, 50, ThemeEntryID_ICON_FOLDER);
+            DrawElement(x + text_xoffset, y + 5, h-10, h-10, ThemeEntryID_ICON_FOLDER);
         } else {
             auto icon = ThemeEntryID_ICON_FILE;
             const auto ext = e.GetExtension();
@@ -564,7 +564,7 @@ void FsView::Draw(NVGcontext* vg, Theme* theme) {
                 icon = ThemeEntryID_ICON_NRO;
             }
 
-            DrawElement(x + text_xoffset, y + 5, 50, 50, icon);
+            DrawElement(x + text_xoffset, y + 5, h-10, h-10, icon);
         }
 
         if (e.IsSelected()) {
@@ -645,6 +645,10 @@ void FsView::SetSide(ViewSide side) {
     this->SetPos(pos);
     Vec4 v{75, GetY() + 1.f + 42.f, 1220.f - 45.f * 2, 60};
 
+    if (m_menu->IsEmbedded()) {
+        v = {GetX()+8, GetY()+32, GetW()-16, 50};
+    }
+
     if (m_menu->IsSplitScreen()) {
         if (m_side == ViewSide::Left) {
             this->SetW(pos.w / 2 - pos.x / 2);
@@ -664,7 +668,7 @@ void FsView::SetSide(ViewSide side) {
         }
     }
 
-    m_list = std::make_unique<List>(1, 8, m_pos, v);
+    m_list = std::make_unique<List>(1, m_menu->IsEmbedded() ? 10 : 8, m_pos, v);
     if (m_menu->IsSplitScreen()) {
         m_list->SetPageJump(false);
     }
@@ -2016,6 +2020,11 @@ void Base::Draw(NVGcontext* vg, Theme* theme) {
     ON_SCOPE_EXIT(RemoveActions(view_actions));
 
     MenuBase::Draw(vg, theme);
+    if (IsEmbedded()) {
+        nvgSave(vg); nvgIntersectScissor(vg, GetX(), GetY(), GetW(), 30);
+        gfx::drawText(vg, GetX()+10, GetY()+8, 17, theme->GetColour(ThemeEntryID_TEXT_SELECTED), view->m_path.s);
+        nvgRestore(vg);
+    }
 
     if (IsSplitScreen()) {
         view_left->Draw(vg, theme);
@@ -2208,7 +2217,7 @@ void Base::LoadAssocEntries() {
             romfsExit();
         }
         // then load custom entries
-        LoadAssocEntriesPath("/config/sphaira/assoc/");
+        LoadAssocEntriesPath("/config/NinMagicFoil/assoc/");
     }
 }
 

@@ -28,6 +28,14 @@ struct Menu final : grid::Menu {
     void Draw(NVGcontext* vg, Theme* theme) override;
     void OnFocusGained() override;
 
+    // One persistent catalog is shared by the shell's category tabs.
+    void SelectCategory(sphaira::ownfoil::api::Category category, bool prompt_search = false);
+    void ShowServers();
+    void AddServer();
+    auto CanGoUp() const -> bool { return m_mode == Mode::Home && !m_connecting && !m_directory_stack.empty(); }
+    void GoUp();
+
+
 private:
     enum class Mode {
         ServerList,
@@ -111,6 +119,8 @@ private:
     void RestoreAction(Button button, std::optional<Action>& prev);
     void DeleteSelected();
 
+    void LayoutServerList();
+    auto DiscoverButton() const -> Vec4;
     void DrawDiscoverButton(NVGcontext* vg, Theme* theme) const;
 
     auto FindDiscovered(const std::string& uid) const -> const sphaira::ownfoil::discovery::DiscoveredServer*;
@@ -174,6 +184,7 @@ private:
     std::optional<s64> m_pending_page{};
     std::unique_ptr<utils::Async> m_loader{};
     std::string m_base_url{};
+    std::vector<std::string> m_directory_stack{};
     // artwork the shop serves itself is gated like the catalog, so drawing needs
     // its credentials.
     sphaira::ownfoil::Config m_config{};

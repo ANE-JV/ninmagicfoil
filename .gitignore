@@ -1,3 +1,15 @@
+.local/
+build/
+dist/
+*.nro
+*.nsp
+*.nsz
+*.xci
+*.xcz
+*.elf
+*.nacp
+*.map
+__pycache__/
 nxbuild
 build*/
 build/*

@@ -14,7 +14,7 @@
 #if sphaira_USE_LOG
 namespace {
 
-constexpr const char* logpath = "/config/sphaira/log.txt";
+constexpr const char* logpath = "/config/NinMagicFoil/log.txt";
 
 std::atomic_int32_t nxlink_socket{};
 std::atomic_bool g_file_open{};

@@ -8,6 +8,7 @@ Menu::Menu(const Callback& cb, const std::vector<std::string>& filter, const fs:
 , m_callback{cb} {
     SetFilter(filter);
     SetTitle("File Picker"_i18n);
+    if (!path.empty()) view->Scan(path);
 }
 
 void Menu::OnClick(FsView* view, const FsEntry& fs_entry, const FileEntry& entry, const fs::FsPath& path) {

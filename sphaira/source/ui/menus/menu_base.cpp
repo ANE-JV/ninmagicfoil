@@ -47,6 +47,7 @@ auto MenuBase::GetPolledData(bool force_refresh) -> PolledData {
 MenuBase::MenuBase(const std::string& title, u32 flags) : m_title{title}, m_flags{flags} {
     // this->SetParent(this);
     this->SetPos(30, 87, 1220 - 30, 646 - 87);
+    if (IsEmbedded()) SetPos(390, 96, 860, 538);
     SetAction(Button::START, Action{App::Exit});
 }
 
@@ -58,6 +59,7 @@ void MenuBase::Update(Controller* controller, TouchInfo* touch) {
 }
 
 void MenuBase::Draw(NVGcontext* vg, Theme* theme) {
+    if (IsEmbedded()) return;
     DrawElement(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, ThemeEntryID_BACKGROUND);
     Widget::Draw(vg, theme);
 

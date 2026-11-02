@@ -12,6 +12,8 @@
 #include <cstring>
 #include <cstdio>
 #include <minIni.h>
+#include <curl/curl.h>
+#include <cctype>
 #include <switch.h>
 
 namespace sphaira::ownfoil {
@@ -19,12 +21,11 @@ namespace {
 
 using namespace sphaira::ui;
 
-#define OWNFOIL_INI_PATH "/config/sphaira/ownfoil.ini"
+#define OWNFOIL_INI_PATH "/config/NinMagicFoil/ownfoil.ini"
 
 constexpr const char* PLACEHOLDER_UID_PREFIX = "pending-";
 
-// the random part only has to be unique among local entries; it is discarded
-// the moment the server supplies a real uid.
+// The local profile key remains stable even if the server identity changes.
 auto GeneratePlaceholderUid() -> std::string {
     char buf[32]{};
     std::snprintf(buf, sizeof(buf), "%s%016lx", PLACEHOLDER_UID_PREFIX, randomGet64());
@@ -43,38 +44,63 @@ OwnfoilForm::OwnfoilForm(const Config& config, const OnSaved& on_saved)
 void OwnfoilForm::SetupButtons() {
     m_name = this->Add<SidebarEntryTextInput>(
         "Name"_i18n, m_config.name, "", "", -1, 32,
-        "Set the display name of the server.\n\n"
-        "Replaced by the name the server reports once it has been connected to."_i18n
+        "Display name for this saved server profile."_i18n
     );
 
     m_local_address = this->Add<SidebarEntryTextInput>(
-        "Local address"_i18n, m_config.local_address, "", "", -1, PATH_MAX,
-        "Address used to reach the server from the same Wi-Fi network.\n\n"
-        "At least one of Local address or Remote address must be set."_i18n
+        "URL"_i18n, m_config.local_address, "", "", -1, PATH_MAX,
+        "Server URL, including http:// or https:// and any path. Enter login details in the separate fields."_i18n
     );
 
     m_remote_address = this->Add<SidebarEntryTextInput>(
-        "Remote address"_i18n, m_config.remote_address, "", "", -1, PATH_MAX,
-        "Address used to reach the server remotely.\n\n"
-        "At least one of Local address or Remote address must be set."_i18n
+        "Alternative URL"_i18n, m_config.remote_address, "", "", -1, PATH_MAX,
+        "Optional second URL for the same server, for example its remote address."_i18n
     );
 
     m_user = this->Add<SidebarEntryTextInput>(
-        "User"_i18n, m_config.user, "", "", -1, PATH_MAX,
+        "Username"_i18n, m_config.user, "", "", -1, PATH_MAX,
         "Optional: username used to log in to the server."_i18n
     );
 
-    m_pass = this->Add<SidebarEntryTextInput>(
-        "Pass"_i18n, m_config.pass, "", "", -1, PATH_MAX,
-        "Optional: password used to log in to the server."_i18n
+    m_pass = this->Add<SidebarEntryTextBase>(
+        "Password"_i18n, m_config.pass.empty() ? "" : "********", [this]() {
+            SwkbdConfig keyboard{};
+            if (R_FAILED(swkbdCreate(&keyboard, 0))) return;
+            ON_SCOPE_EXIT(swkbdClose(&keyboard));
+            swkbdConfigMakePresetDefault(&keyboard);
+            swkbdConfigSetType(&keyboard, SwkbdType_All);
+            swkbdConfigSetInitialText(&keyboard, m_config.pass.c_str());
+            swkbdConfigSetStringLenMax(&keyboard, 256);
+            keyboard.arg.arg.arg.passwordFlag = 1;
+            char password[1025]{};
+            if (R_SUCCEEDED(swkbdShow(&keyboard, password, sizeof(password)))) {
+                m_config.pass = password;
+                m_pass->SetValue(m_config.pass.empty() ? "" : "********");
+            }
+            std::fill(std::begin(password), std::end(password), 0);
+        }, "Saved locally on this SD card. The password is hidden on screen, not encrypted on disk."_i18n
     );
 
+    this->Add<SidebarEntryArray>("Server type"_i18n,
+        SidebarEntryArray::Items{"Automatic"_i18n, "Ownfoil API", "Tinfoil JSON", "Ownfoil legacy"},
+        [this](s64& index) { m_config.backend = static_cast<Backend>(index); },
+        static_cast<s64>(m_config.backend), "Automatic tries the Ownfoil API and then a plain JSON shop index."_i18n);
+
     const auto callback = this->Add<SidebarEntryCallback>("Save"_i18n, [this](){
+        const auto& primary = m_local_address->GetValue();
+        const auto& alternative = m_remote_address->GetValue();
+        if ((!primary.empty() && !IsSafeAddress(primary)) || (!alternative.empty() && !IsSafeAddress(alternative))) {
+            App::Notify("Use an HTTP(S) URL without embedded credentials or a fragment."_i18n);
+            return;
+        }
+        if (primary != m_config.local_address || alternative != m_config.remote_address) {
+            m_config.resolved_url.clear();
+            m_config.server_uid.clear();
+        }
         m_config.name = m_name->GetValue();
         m_config.local_address = m_local_address->GetValue();
         m_config.remote_address = m_remote_address->GetValue();
         m_config.user = m_user->GetValue();
-        m_config.pass = m_pass->GetValue();
 
         // a brand new entry gets a placeholder uid until its first connect.
         SaveConfig(m_config);
@@ -91,7 +117,44 @@ void OwnfoilForm::SetupButtons() {
         return
             !m_name->GetValue().empty() &&
             (!m_local_address->GetValue().empty() || !m_remote_address->GetValue().empty());
-    }, "Name and at least one of Local/Remote address must be set!"_i18n);
+    }, "Name and at least one URL must be set!"_i18n);
+}
+
+auto IsSafeAddress(const std::string& address) -> bool {
+    if (address.empty() || address.find_first_of("\r\n\t #") != std::string::npos) return false;
+    auto url = address.find("://") == std::string::npos ? "http://" + address : address;
+    CURLU* parsed = curl_url();
+    if (!parsed) return false;
+    ON_SCOPE_EXIT(curl_url_cleanup(parsed));
+    if (curl_url_set(parsed, CURLUPART_URL, url.c_str(), 0) != CURLUE_OK) return false;
+    char* value{};
+    if (curl_url_get(parsed, CURLUPART_USER, &value, 0) == CURLUE_OK) {
+        curl_free(value);
+        return false;
+    }
+    if (curl_url_get(parsed, CURLUPART_SCHEME, &value, 0) != CURLUE_OK) return false;
+    const bool allowed = !std::strcmp(value, "http") || !std::strcmp(value, "https");
+    curl_free(value);
+    return allowed;
+}
+
+auto IsSameOrigin(const std::string& base, const std::string& target) -> bool {
+    if (!IsSafeAddress(base) || !IsSafeAddress(target)) return false;
+    CURLU* a = curl_url();
+    CURLU* b = curl_url();
+    ON_SCOPE_EXIT(if (a) curl_url_cleanup(a); if (b) curl_url_cleanup(b));
+    if (!a || !b || curl_url_set(a, CURLUPART_URL, base.c_str(), 0) != CURLUE_OK
+        || curl_url_set(b, CURLUPART_URL, target.c_str(), 0) != CURLUE_OK) return false;
+    for (const auto part : {CURLUPART_SCHEME, CURLUPART_HOST, CURLUPART_PORT}) {
+        char *left{}, *right{};
+        const auto l = curl_url_get(a, part, &left, CURLU_DEFAULT_PORT);
+        const auto r = curl_url_get(b, part, &right, CURLU_DEFAULT_PORT);
+        const auto same = l == CURLUE_OK && r == CURLUE_OK && !strcasecmp(left, right);
+        curl_free(left);
+        curl_free(right);
+        if (!same) return false;
+    }
+    return true;
 }
 
 void LoadConfigs(Configs& out_configs) {
@@ -107,7 +170,12 @@ void LoadConfigs(Configs& out_configs) {
             e->back().uid = Section;
         }
 
-        if (!std::strcmp(Key, "name")) {
+        if (!std::strcmp(Key, "server_uid")) {
+            e->back().server_uid = Value;
+        } else if (!std::strcmp(Key, "backend")) {
+            e->back().backend = !std::strcmp(Value, "json") ? Backend::JsonIndex :
+                !std::strcmp(Value, "native") ? Backend::Native : !std::strcmp(Value, "legacy") ? Backend::LegacyHtml : Backend::Auto;
+        } else if (!std::strcmp(Key, "name")) {
             e->back().name = Value;
         } else if (!std::strcmp(Key, "local_address")) {
             e->back().local_address = Value;
@@ -120,7 +188,7 @@ void LoadConfigs(Configs& out_configs) {
         } else if (!std::strcmp(Key, "resolved_url")) {
             e->back().resolved_url = Value;
         } else {
-            log_write("[OWNFOIL] INI: unknown key %s=%s\n", Key, Value);
+            log_write("[OWNFOIL] Ignoring unknown configuration key\n");
         }
 
         return 1;
@@ -142,14 +210,14 @@ void SaveConfig(Config& config, const std::string& previous_uid) {
 
     // the uid is the ini section, so replacing it is a delete plus a re-write.
     if (!previous_uid.empty() && previous_uid != config.uid) {
-        log_write("[OWNFOIL] re-keying entry %s: %s -> %s\n", config.name.c_str(),
-            IsPlaceholderUid(previous_uid) ? "placeholder" : previous_uid.c_str(), config.uid.c_str());
+        log_write("[OWNFOIL] Updating local profile key\n");
         DeleteConfig(previous_uid);
     }
 
-    // no duplicate pass is needed: the uid *is* the section, so promoting a
-    // hand-added entry onto an already-saved uid collapses the two.
-    fs::FsNativeSd().CreateDirectoryRecursively("/config/sphaira/");
+    // Profiles are kept separate even when they use the same server UID.
+    fs::FsNativeSd().CreateDirectoryRecursively("/config/NinMagicFoil/");
+    ini_puts(config.uid.c_str(), "server_uid", config.server_uid.c_str(), OWNFOIL_INI_PATH);
+    ini_puts(config.uid.c_str(), "backend", config.backend == Backend::JsonIndex ? "json" : config.backend == Backend::Native ? "native" : config.backend == Backend::LegacyHtml ? "legacy" : "auto", OWNFOIL_INI_PATH);
     ini_puts(config.uid.c_str(), "name", config.name.c_str(), OWNFOIL_INI_PATH);
     ini_puts(config.uid.c_str(), "local_address", config.local_address.c_str(), OWNFOIL_INI_PATH);
     ini_puts(config.uid.c_str(), "remote_address", config.remote_address.c_str(), OWNFOIL_INI_PATH);
@@ -168,7 +236,7 @@ auto FindByUid(Configs& configs, const std::string& uid) -> Config* {
     }
 
     const auto it = std::find_if(configs.begin(), configs.end(), [&uid](const auto& e) {
-        return e.uid == uid;
+        return e.uid == uid || e.server_uid == uid;
     });
 
     return it == configs.end() ? nullptr : &*it;

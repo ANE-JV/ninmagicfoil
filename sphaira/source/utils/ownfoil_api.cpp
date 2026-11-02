@@ -1,4 +1,5 @@
 #include "utils/ownfoil_api.hpp"
+#include "utils/ownfoil_index.hpp"
 
 #include "download.hpp"
 #include "defines.hpp"
@@ -6,6 +7,11 @@
 #include "i18n.hpp"
 
 #include <yyjson.h>
+#include <curl/curl.h>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <cstring>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -17,9 +23,6 @@ namespace {
 // every address ends up as the bare root url of its server.
 auto WithScheme(const char* scheme, const std::string& address) -> std::string {
     auto url = scheme + address;
-    if (!url.ends_with("/")) {
-        url += "/";
-    }
     return url;
 }
 
@@ -27,6 +30,7 @@ auto WithScheme(const char* scheme, const std::string& address) -> std::string {
 // an ip, a port or a dotless name is a lan shop and plain http, while a domain
 // tries https first, since basic auth has no business going out in the clear.
 auto BuildUrls(const std::string& address) -> std::vector<std::string> {
+    if (!IsSafeAddress(address)) return {};
     if (address.starts_with("http://") || address.starts_with("https://")) {
         return {WithScheme("", address)};
     }
@@ -45,7 +49,7 @@ auto BuildUrls(const std::string& address) -> std::vector<std::string> {
     if (is_ip_literal || has_port || is_lan_name) {
         return {WithScheme("http://", address)};
     }
-    return {WithScheme("https://", address), WithScheme("http://", address)};
+    return {WithScheme("https://", address)};
 }
 
 // the url that answered last time, as the entry remembers it: probing costs a
@@ -187,51 +191,250 @@ auto ParseHandshake(const std::vector<u8>& data, ConnectResult& out) -> bool {
     return true;
 }
 
-// tries a single url, filling `out` either way.
-auto TryConnect(const std::string& url, const Config& config, std::stop_token token, ConnectResult& out) -> bool {
-    log_write("[OWNFOIL] handshake with %s\n", url.c_str());
-
-    const auto result = curl::Api().ToMemory(
-        curl::Url{url},
-        curl::CustomRequest{"OPTIONS"},
-        curl::UserPass{config.user, config.pass},
-        curl::PreemptiveAuth{true},
-        // an error status carries the server's own explanation, worth more than
-        // the status alone - and with it kept, only an unreachable server fails
-        // the transfer, so the status says whether the handshake worked.
-        curl::Flags{curl::Flag_KeepErrorBody},
-        curl::StopToken{token}
-    );
-
-    if (!result.success) {
-        out.error = "Could not reach the server"_i18n;
-        return false;
+// Resolve relative paths with RFC URL rules. A leading slash is relative to
+// the origin, not to the configured reverse-proxy path.
+auto ResolveUrl(const std::string& base, const std::string& relative) -> std::string {
+    if (relative.empty()) return {};
+    CURLU* parsed = curl_url();
+    if (!parsed) return {};
+    ON_SCOPE_EXIT(curl_url_cleanup(parsed));
+    auto escaped = relative;
+    size_t space{};
+    while ((space = escaped.find(' ', space)) != std::string::npos) {
+        escaped.replace(space, 1, "%20");
+        space += 3;
     }
-    out.reached = true;
+    if (curl_url_set(parsed, CURLUPART_URL, base.c_str(), 0) != CURLUE_OK
+        || curl_url_set(parsed, CURLUPART_URL, escaped.c_str(), 0) != CURLUE_OK) return {};
+    char* value{};
+    if (curl_url_get(parsed, CURLUPART_URL, &value, 0) != CURLUE_OK) return {};
+    std::string url = value;
+    curl_free(value);
+    return IsSafeAddress(url) ? url : std::string{};
+}
 
-    if (result.code != 200) {
-        out.error = ParseError(result.data);
+struct IndexCache {
+    std::string url, user, pass;
+    std::shared_ptr<const std::vector<index::File>> files;
+    bool legacy{};
+};
+std::mutex g_index_mutex;
+IndexCache g_index_cache;
 
-        // a refusal the server phrased itself settles the matter: every address
-        // and scheme leads to that same server and the same answer.
-        out.refused = !out.error.empty() || result.code == 401 || result.code == 403;
-
-        if (out.error.empty()) {
-            if (result.code == 401 || result.code == 403) {
-                out.error = "Incorrect username or password"_i18n;
-            } else {
-                out.error = "Server returned an error"_i18n + " (" + std::to_string(result.code) + ")";
-            }
+auto FetchIndex(const std::string& url, const Config& config, std::stop_token token,
+    std::shared_ptr<const std::vector<index::File>>& files, std::string& error, bool refresh = false, bool* legacy_result = nullptr) -> bool {
+    if (!refresh) {
+        std::scoped_lock lock(g_index_mutex);
+        if (g_index_cache.files && g_index_cache.url == url && g_index_cache.user == config.user && g_index_cache.pass == config.pass) {
+            files = g_index_cache.files;
+            if (legacy_result) *legacy_result = g_index_cache.legacy;
+            return true;
         }
+    }
+    // Catalogues are metadata, not packages: refuse an accidental file endpoint
+    // before it can grow the metadata buffer to gigabytes.
+    constexpr s64 MAX_INDEX_BYTES = 64 * 1024 * 1024;
+    const auto request = [&](bool legacy) {
+        return curl::Api().ToMemory(curl::Url{url}, curl::UserPass{config.user, config.pass},
+            curl::PreemptiveAuth{true}, curl::Flags{curl::Flag_KeepErrorBody | (legacy ? curl::Flag_LegacyOwnfoil : 0)}, curl::StopToken{token},
+            curl::OnProgress{[](s64 total, s64 now, s64, s64) { return total <= MAX_INDEX_BYTES && now <= MAX_INDEX_BYTES; }});
+    };
+    bool legacy = config.legacy_html || config.backend == Backend::LegacyHtml;
+    auto result = request(legacy);
+    if (token.stop_requested()) return false;
+    if (result.code == 401 || result.code == 403) {
+        error = "Incorrect username or password"_i18n;
         return false;
     }
-
-    if (!ParseHandshake(result.data, out)) {
+    auto parsed = std::make_shared<std::vector<index::File>>();
+    bool parsed_ok{};
+    if (!legacy && result.success && result.code == 200 && result.data.size() <= MAX_INDEX_BYTES) {
+        parsed_ok = index::Parse(reinterpret_cast<const char*>(result.data.data()), result.data.size(), *parsed, error);
+    }
+    if (!legacy && !parsed_ok && config.backend != Backend::JsonIndex) {
+        legacy = true;
+        result = request(true);
+    }
+    if (!result.success || result.code != 200 || result.data.size() > MAX_INDEX_BYTES) {
+        error = "Could not load the shop index (HTTP error or metadata size limit)"_i18n;
         return false;
     }
+    if (legacy) parsed_ok = index::ParseHtml(reinterpret_cast<const char*>(result.data.data()), result.data.size(), *parsed, error);
+    if (!parsed_ok) return false;
+    error.clear();
+    if (legacy_result) *legacy_result = legacy;
+    for (auto& file : *parsed) {
+        file.url = ResolveUrl(url, file.url);
+        file.icon = ResolveUrl(url, file.icon);
+        file.banner = ResolveUrl(url, file.banner);
+    }
+    std::erase_if(*parsed, [](const auto& file) { return file.url.empty(); });
+    files = parsed;
+    std::scoped_lock lock(g_index_mutex);
+    g_index_cache = {url, config.user, config.pass, files, legacy};
+    return true;
+}
 
-    out.base_url = url;
+auto IndexId(const index::File& file) -> std::string {
+    return file.id.empty() ? "package-" + std::to_string(std::hash<std::string>{}(file.url)) : file.id;
+}
+
+auto IndexApp(const index::File& file, const std::string& base_url) -> ShopApp {
+    ShopApp app;
+    app.directory = file.directory;
+    app.type = file.kind == index::Kind::Update ? AppType::Update : file.kind == index::Kind::Dlc ? AppType::Dlc : AppType::Base;
+    app.app_id = IndexId(file);
+    app.title_id = file.title_id.empty() ? app.app_id : file.title_id;
+    app.name = file.directory ? "[+] " + file.name : file.name;
+    app.publisher = file.publisher;
+    app.version = file.version ? "v" + std::to_string(file.version) : "";
+    app.icon = {file.icon, IsSameOrigin(base_url, file.icon)};
+    app.banner = {file.banner, IsSameOrigin(base_url, file.banner)};
+    app.download = {file.url, file.extension, file.size, file.sha256};
+    return app;
+}
+
+auto Contains(const std::vector<std::string>& values, const std::string& id) -> bool {
+    return std::find(values.begin(), values.end(), id) != values.end();
+}
+
+auto FetchIndexApps(const std::string& base_url, const Config& config, std::stop_token token,
+    const CatalogQuery& query, std::vector<ShopApp>& out, s64& total, std::string& error) -> bool {
+    std::shared_ptr<const std::vector<index::File>> files;
+    if (!FetchIndex(base_url, config, token, files, error)) return false;
+    std::vector<const index::File*> selected;
+    std::unordered_map<std::string, size_t> by_id;
+    const auto search = index::Lower(query.search);
+    for (const auto& file : *files) {
+        bool include{};
+        const auto base = file.kind == index::Kind::Base || file.kind == index::Kind::Unknown;
+        switch (query.category) {
+            case Category::All: include = base; break;
+            case Category::NewGames: include = base && !Contains(query.app_ids, file.id); break;
+            case Category::Updates: include = file.kind == index::Kind::Update && Contains(query.app_ids, file.id); break;
+            case Category::Dlc: include = file.kind == index::Kind::Dlc && Contains(query.title_ids, file.title_id) && !Contains(query.app_ids, file.id); break;
+            case Category::Search: include = base && !search.empty() &&
+                (index::Lower(file.name).find(search) != std::string::npos || index::Lower(file.id).find(search) != std::string::npos); break;
+        }
+        if (file.directory && query.category != Category::Search) include = true;
+        if (!include) continue;
+        const auto key = IndexId(file);
+        if (const auto found = by_id.find(key); found != by_id.end()) {
+            if (file.version > selected[found->second]->version) selected[found->second] = &file;
+        } else {
+            by_id.emplace(key, selected.size());
+            selected.push_back(&file);
+        }
+    }
+    // Generic indices have no uniform added/release date field. Preserve source
+    // order for those choices instead of claiming fabricated dates.
+    if (!std::strcmp(query.order_field, "NAME")) {
+        std::stable_sort(selected.begin(), selected.end(), [](const auto a, const auto b) {
+            if (a->directory != b->directory) return a->directory;
+            return index::Lower(a->name) < index::Lower(b->name);
+        });
+    }
+    if (query.descending) std::reverse(selected.begin(), selected.end());
+    total = static_cast<s64>(selected.size());
+    const auto count = std::clamp<s64>(query.page_size, 1, 1000);
+    const auto begin = std::min(total, std::max<s64>(0, query.page - 1) * count);
+    for (auto i = begin; i < std::min(total, begin + count); ++i) out.push_back(IndexApp(*selected[i], base_url));
+    return true;
+}
+
+auto FetchIndexUpdates(const std::string& base_url, const Config& config, std::stop_token token,
+    const std::vector<std::string>& ids, std::vector<ShopUpdate>& out, std::string& error) -> bool {
+    std::shared_ptr<const std::vector<index::File>> files;
+    if (!FetchIndex(base_url, config, token, files, error)) return false;
+    std::unordered_map<std::string, size_t> newest;
+    for (const auto& file : *files) {
+        if (file.kind != index::Kind::Update || !Contains(ids, file.title_id)) continue;
+        if (const auto found = newest.find(file.id); found != newest.end()) {
+            out[found->second].version = std::max<s64>(out[found->second].version, file.version);
+        } else {
+            newest.emplace(file.id, out.size());
+            out.push_back({file.id, file.title_id, file.version});
+        }
+    }
+    return true;
+}
+
+auto FetchIndexTitle(const std::string& base_url, const Config& config, std::stop_token token,
+    const std::string& id, ShopTitle& out, std::string& error) -> bool {
+    std::shared_ptr<const std::vector<index::File>> files;
+    if (!FetchIndex(base_url, config, token, files, error)) return false;
+    bool found{};
+    std::unordered_map<std::string, size_t> addons;
+    for (const auto& file : *files) {
+        const auto own_id = IndexId(file);
+        if (own_id != id && file.title_id != id) continue;
+        found = true;
+        if (own_id == id) {
+            out.name = file.name;
+            out.publisher = file.publisher;
+            out.banner = {file.banner, IsSameOrigin(base_url, file.banner)};
+            out.full_banner = out.banner;
+            out.download_size = file.size;
+        }
+        if (file.kind == index::Kind::Dlc && own_id != id) {
+            if (const auto prior = addons.find(file.id); prior != addons.end()) {
+                auto& row = out.dlc[prior->second];
+                if (file.version > row.version) {
+                    row.version = file.version;
+                    row.download = {file.url, file.extension, file.size, file.sha256};
+                }
+            } else {
+                addons.emplace(file.id, out.dlc.size());
+                ShopContent row;
+                row.app_id = file.id; row.name = file.name; row.version = file.version;
+                row.banner = {file.banner, IsSameOrigin(base_url, file.banner)};
+                row.download = {file.url, file.extension, file.size, file.sha256};
+                out.dlc.push_back(std::move(row));
+            }
+        } else if (file.kind != index::Kind::Dlc) {
+            const auto duplicate = std::find_if(out.versions.begin(), out.versions.end(), [&](const auto& version) { return version.version == file.version; });
+            if (duplicate == out.versions.end()) out.versions.push_back({file.version, {}, {file.url, file.extension, file.size, file.sha256}});
+            out.available_version = std::max<s64>(out.available_version, file.version);
+        }
+    }
+    std::sort(out.versions.begin(), out.versions.end(), [](const auto& a, const auto& b) { return a.version < b.version; });
+    if (!found) error = "This package is no longer in the index"_i18n;
+    return found;
+}
+
+// Native API first; plain JSON fallback never drops the configured credentials.
+auto TryConnect(const std::string& url, const Config& config, std::stop_token token, ConnectResult& out) -> bool {
+    if (token.stop_requested() || !IsSafeAddress(url)) return false;
+    log_write("[OWNFOIL] Connecting to configured server\n");
+    if (config.backend != Backend::JsonIndex && config.backend != Backend::LegacyHtml) {
+        const auto result = curl::Api().ToMemory(curl::Url{url}, curl::CustomRequest{"OPTIONS"},
+            curl::UserPass{config.user, config.pass}, curl::PreemptiveAuth{true},
+            curl::Flags{curl::Flag_KeepErrorBody}, curl::StopToken{token});
+        out.reached = result.code != 0;
+        if (result.code == 401 || result.code == 403) {
+            out.refused = true;
+            out.error = "Incorrect username or password"_i18n;
+            return false;
+        }
+        if (result.success && result.code == 200 && ParseHandshake(result.data, out)) {
+            out.base_url = url.ends_with('/') ? url : url + '/';
+            out.success = true;
+            return true;
+        }
+        if (config.backend == Backend::Native) {
+            if (out.error.empty()) out.error = "Could not connect to the Ownfoil API"_i18n;
+            return false;
+        }
+    }
+    std::shared_ptr<const std::vector<index::File>> files;
+    out.error.clear();
+    if (!FetchIndex(url, config, token, files, out.error, true, &out.legacy_html)) return false;
     out.success = true;
+    out.json_index = true;
+    out.base_url = url;
+    out.info = {};
+    out.info.name = config.name;
+    out.info.features.shop = true;
     return true;
 }
 
@@ -275,9 +478,8 @@ auto ParseImage(yyjson_val* obj, const std::string& base_url, ShopImage& out) ->
     out.url = yyjson_get_str(url);
 
     // base_url already carries its trailing '/'.
-    if (out.local && out.url.front() == '/') {
-        out.url = base_url + out.url.substr(1);
-    }
+    out.url = ResolveUrl(base_url, out.url);
+    out.local = out.local && IsSameOrigin(base_url, out.url);
 }
 
 // the same, for the Image stored under `key`.
@@ -396,10 +598,10 @@ auto ParseVersion(yyjson_val* item) -> std::string {
 auto ParseDownload(yyjson_val* item, const std::string& base_url) -> ShopDownload {
     ShopDownload out{};
     out.url = GetString(item, "downloadUrl");
-    out.extension = GetString(item, "downloadExtension");
-    if (!out.url.empty() && out.url.front() == '/') {
-        out.url = base_url + out.url.substr(1);
-    }
+    out.extension = index::Lower(GetString(item, "downloadExtension"));
+    if (out.extension != "nsp" && out.extension != "nsz" && out.extension != "xci" && out.extension != "xcz") out.extension.clear();
+    out.url = ResolveUrl(base_url, out.url);
+    out.size = index::Integer(item, "downloadSize");
     return out;
 }
 
@@ -733,7 +935,7 @@ auto JsonString(const std::string& str) -> std::string {
 // THUMB, the size a card draws it at.
 constexpr const char* BASE_FIELDS = "appId displayVersion latestOwnedVersion{displayVersion} titledb{name publisher icon(size:THUMB){url local} banner(size:THUMB){url local}}";
 constexpr const char* UPDATE_FIELDS = "appId titleId displayVersion title{name publisher icon(size:THUMB){url local} banner(size:THUMB){url local}}";
-constexpr const char* DLC_FIELDS = "appId titleId displayVersion downloadUrl downloadExtension titledb{name publisher banner(size:THUMB){url local}} title{name icon(size:THUMB){url local}}";
+constexpr const char* DLC_FIELDS = "appId titleId displayVersion downloadUrl downloadExtension downloadSize titledb{name publisher banner(size:THUMB){url local}} title{name icon(size:THUMB){url local}}";
 
 // what a page draws beyond its card, at CLIENT for the page and SCREEN for the
 // viewer. `availableVersions` is the catalogue's ascending list, so its last is
@@ -744,7 +946,7 @@ constexpr const char* DLC_FIELDS = "appId titleId displayVersion downloadUrl dow
 // row fields at THUMB, and a download apiece for Install.
 // note this needs a shop with the aliased-nested-selection fix: an older one
 // hydrates every alias with the first's fields and the dlc arrive nameless.
-constexpr const char* TITLE_QUERY = "query($id:ID!){title(titleId:$id){name publisher intro description releaseDate category numberOfPlayers size rating region banner(size:CLIENT){url local} fullBanner:banner(size:SCREEN){url local} availableVersions{version releaseDate} screenshots(size:CLIENT){url local} full:screenshots(size:SCREEN){url local} base:apps(owned:true,appType:[BASE]){displayVersion downloadSize downloadUrl downloadExtension latestOwnedVersion{version displayVersion}} updates:apps(owned:true,appType:[UPDATE]){appVersion displayVersion downloadUrl downloadExtension} dlc:apps(owned:true,appType:[DLC]){appId appVersion downloadUrl downloadExtension titledb{name intro banner(size:THUMB){url local}}}}}";
+constexpr const char* TITLE_QUERY = "query($id:ID!){title(titleId:$id){name publisher intro description releaseDate category numberOfPlayers size rating region banner(size:CLIENT){url local} fullBanner:banner(size:SCREEN){url local} availableVersions{version releaseDate} screenshots(size:CLIENT){url local} full:screenshots(size:SCREEN){url local} base:apps(owned:true,appType:[BASE]){displayVersion downloadUrl downloadExtension downloadSize latestOwnedVersion{version displayVersion}} updates:apps(owned:true,appType:[UPDATE]){appVersion displayVersion downloadUrl downloadExtension downloadSize} dlc:apps(owned:true,appType:[DLC]){appId appVersion downloadUrl downloadExtension downloadSize titledb{name intro banner(size:THUMB){url local}}}}}";
 
 // the update pre-pass: ids and versions only, for exactly the title ids asked.
 constexpr const char* UPDATES_QUERY = "query($page:Int!,$pageSize:Int!,$titleIds:[String!]){apps(owned:true,appType:[UPDATE],groupByAppId:true,filter:{titleId:{in:$titleIds}},page:$page,pageSize:$pageSize){total items{appId titleId appVersion}}}";
@@ -855,6 +1057,7 @@ auto Connect(const Config& config, std::stop_token token) -> ConnectResult {
 auto FetchApps(const std::string& base_url, const Config& config, std::stop_token token, const CatalogQuery& query, std::vector<ShopApp>& out, s64& total, std::string& error) -> bool {
     out.clear();
     total = 0;
+    if (config.json_index) return FetchIndexApps(base_url, config, token, query, out, total, error);
 
     // an empty list is no constraint to the shop, so a category narrowed by one
     // the console can't supply would answer with the whole catalog rather than
@@ -888,6 +1091,7 @@ auto FetchApps(const std::string& base_url, const Config& config, std::stop_toke
 
 auto FetchUpdates(const std::string& base_url, const Config& config, std::stop_token token, const std::vector<std::string>& title_ids, std::vector<ShopUpdate>& out, std::string& error) -> bool {
     out.clear();
+    if (config.json_index) return FetchIndexUpdates(base_url, config, token, title_ids, out, error);
 
     // as above: asking with an empty list would name every update in the shop.
     if (title_ids.empty()) {
@@ -928,7 +1132,8 @@ auto FetchUpdates(const std::string& base_url, const Config& config, std::stop_t
 auto FetchTitle(const std::string& base_url, const Config& config, std::stop_token token, const std::string& id, ShopTitle& out, std::string& error) -> bool {
     out = {};
 
-    log_write("[OWNFOIL] fetching title %s\n", id.c_str());
+    if (config.json_index) return FetchIndexTitle(base_url, config, token, id, out, error);
+    log_write("[OWNFOIL] Fetching title metadata\n");
 
     // the id rides as a variable, so every page asks the one document the shop's
     // caches already hold.

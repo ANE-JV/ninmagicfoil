@@ -7,20 +7,22 @@
 
 namespace sphaira::ownfoil {
 
-// a saved Ownfoil API server location.
-struct Config {
-    // the entry's key and its ini section name: the server's own id, only ever
-    // learned from a discovery reply or the handshake. an entry that has never
-    // reached its server holds a `pending-` placeholder until then.
-    std::string uid{};
+enum class Backend { Auto, Native, JsonIndex, LegacyHtml };
 
-    // owned by the server, refreshed from the handshake on every connect.
+// A locally saved server profile. Credentials never belong in the URL.
+struct Config {
+    // Stable local key: separate profiles can address the same server.
+    std::string uid{};
+    std::string server_uid{};
     std::string name{};
 
     std::string local_address{};   // host[:port], optional.
     std::string remote_address{};  // host[:port] or hostname, optional.
     std::string user{};
     std::string pass{};
+    Backend backend{Backend::Auto};
+    bool legacy_html{}; // older Ownfoil directory protocol, negotiated at connect
+    bool json_index{}; // negotiated at connect time; never persisted
 
     // the root url that last answered, so a connect goes straight there rather
     // than paying a connect timeout on a dead local address every launch.
@@ -29,6 +31,8 @@ struct Config {
 using Configs = std::vector<Config>;
 
 void LoadConfigs(Configs& out_configs);
+auto IsSafeAddress(const std::string& address) -> bool;
+auto IsSameOrigin(const std::string& base, const std::string& target) -> bool;
 
 // true for a locally generated stand-in uid. the `pending-` namespace is
 // reserved by the API spec, so it can never collide with a real one.
@@ -37,8 +41,7 @@ auto IsPlaceholderUid(const std::string& uid) -> bool;
 // creates or updates a saved server, keyed by config.uid (the ini section), and
 // assigns a placeholder uid when it is empty. pass the entry's former uid as
 // `previous_uid` so the old section is removed - the only way a key ever moves.
-// any *other* entry carrying a real uid is dropped: the server issued it, so
-// two entries sharing one describe the same server.
+// Locally generated keys preserve separate URL/account profiles.
 void SaveConfig(Config& config, const std::string& previous_uid = {});
 
 void DeleteConfig(const std::string& uid);
@@ -63,7 +66,7 @@ private:
     ui::SidebarEntryTextInput* m_local_address{};
     ui::SidebarEntryTextInput* m_remote_address{};
     ui::SidebarEntryTextInput* m_user{};
-    ui::SidebarEntryTextInput* m_pass{};
+    ui::SidebarEntryTextBase* m_pass{};
 };
 
 } // namespace sphaira::ownfoil
